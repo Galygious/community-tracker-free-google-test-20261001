@@ -95,7 +95,9 @@ h2 { margin: 0; font-size: clamp(1.55rem, 3vw, 2.05rem); letter-spacing: -.04em;
 .button-primary:disabled, .button-secondary:disabled { opacity: .56; cursor: wait; }
 .button-secondary { color: var(--forest-dark); background: #fff; border-color: #b8c9ba; }
 .button-secondary:hover:not(:disabled) { background: #edf2e8; }
-.google-button { min-height: 42px; }
+.sign-in-slot { width: 220px; min-height: 44px; }
+.sign-in-slot > .button-primary { width: 100%; min-height: 44px; }
+.google-button { width: 220px; min-height: 44px; }
 .pages-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 13px; }
 .page-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 9px; }
 .page-list .empty-state { grid-column: 1 / -1; padding: 14px; font-size: .87rem; }

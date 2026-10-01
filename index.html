@@ -6,10 +6,10 @@
   <meta name="referrer" content="no-referrer">
   <meta name="theme-color" content="#f4f5ed">
   <title>Hearthside | Community tracker</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=gis-ready-1">
   <script src="config.js" defer></script>
   <script src="bridge.js" defer></script>
-  <script src="app.js?v=public-get-1" defer></script>
+  <script src="app.js?v=gis-ready-1" defer></script>
 </head>
 <body>
   <header class="site-header">
@@ -39,7 +39,7 @@
         <div class="account-card">
           <div class="avatar" aria-hidden="true">✦</div>
           <div class="account-copy"><h3 id="account-name">Your profile is waiting</h3><p id="account-detail">Sign in with Google to open your player profile and the pages shared with your role.</p></div>
-          <div class="account-actions"><button id="sign-in" class="button-primary" type="button">Sign in with Google</button><div id="google-button" class="google-button" aria-label="Google sign-in"></div><button id="refresh-profile" class="button-secondary" type="button" hidden>Refresh profile</button><button id="sign-out" class="button-secondary" type="button" hidden>Sign out</button></div>
+          <div class="account-actions"><div id="sign-in-slot" class="sign-in-slot"><button id="sign-in" class="button-primary" type="button" disabled>Preparing Google sign-in…</button><div id="google-button" class="google-button" aria-label="Google sign-in" hidden></div></div><button id="refresh-profile" class="button-secondary" type="button" hidden>Refresh profile</button><button id="sign-out" class="button-secondary" type="button" hidden>Sign out</button></div>
         </div>
         <div class="shared-pages"><div class="pages-heading"><h3>Pages for you</h3><span id="role-chip" class="role-chip" hidden></span></div><div id="page-list" class="page-list"><p class="empty-state">Your available pages will appear here after you sign in.</p></div></div>
       </div>

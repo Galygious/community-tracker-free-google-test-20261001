@@ -7,9 +7,11 @@ const allowedPublicResponseOrigins = new Set(['https://script.google.com', 'http
 const allowedChallengeOps = new Set(['exchange', 'profile', 'logout']);
 const publicResponseLimit = 512 * 1024;
 let session = null;
-let identityChallenge = null;
-let identityRequestId = null;
 let gisPromise = null;
+let gisInitialized = false;
+let signInGeneration = 0;
+let signInDeadline = 0;
+let signInExpiryTimer = null;
 let busy = false;
 const pending = new Map();
 
@@ -253,12 +255,14 @@ function friendlyError(code) {
   return messages[code] || 'Something went wrong. Please try again.';
 }
 
-function decodeChallengeNonce(challenge) {
+function decodeChallengeIdentity(challenge) {
   const body = challenge.split('.')[0].replace(/-/g, '+').replace(/_/g, '/');
   const decoded = window.atob(body + '='.repeat((4 - body.length % 4) % 4));
   const payload = JSON.parse(decoded);
-  if (typeof payload.nonce !== 'string' || !payload.nonce) throw new Error('The sign-in request could not be prepared.');
-  return payload.nonce;
+  if (typeof payload.nonce !== 'string' || !payload.nonce || !Number.isInteger(payload.exp)) {
+    throw new Error('The sign-in request could not be prepared.');
+  }
+  return { nonce: payload.nonce, exp: payload.exp };
 }
 
 function loadGIS() {
@@ -270,7 +274,11 @@ function loadGIS() {
     script.async = true;
     script.defer = true;
     script.onload = resolve;
-    script.onerror = () => reject(new Error('Google sign-in could not be loaded. Check your connection and try again.'));
+    script.onerror = () => {
+      gisPromise = null;
+      script.remove();
+      reject(new Error('Google sign-in could not be loaded. Check your connection and try again.'));
+    };
     document.head.appendChild(script);
   });
   return gisPromise;
@@ -284,26 +292,57 @@ function setBusy(value) {
   el('sign-in').setAttribute('aria-busy', String(value));
 }
 
-async function beginSignIn() {
-  if (busy) return;
+function retireSignIn(message, tone) {
+  signInGeneration += 1;
+  signInDeadline = 0;
+  if (signInExpiryTimer !== null) window.clearTimeout(signInExpiryTimer);
+  signInExpiryTimer = null;
+  el('google-button').replaceChildren();
+  el('google-button').hidden = true;
+  el('sign-in').textContent = gisInitialized ? 'Refresh sign-in' : 'Try Google sign-in again';
+  el('sign-in').hidden = Boolean(session);
+  el('sign-in-slot').hidden = Boolean(session);
+  if (message) say(message, tone || 'notice');
+}
+
+async function prepareSignIn() {
+  if (busy || session) return;
+  if (gisInitialized) { window.location.reload(); return; }
+  const generation = ++signInGeneration;
   setBusy(true);
   el('google-button').replaceChildren();
+  el('google-button').hidden = true;
+  el('sign-in').textContent = 'Preparing Google sign-in…';
+  el('sign-in').hidden = false;
+  el('sign-in-slot').hidden = false;
   try {
-    identityRequestId = randomRequestId();
-    identityChallenge = await getChallenge('exchange', identityRequestId);
+    const requestId = randomRequestId();
+    const challenge = await getChallenge('exchange', requestId);
     await loadGIS();
-    const nonce = decodeChallengeNonce(identityChallenge);
+    if (generation !== signInGeneration || session) return;
+    const { nonce, exp } = decodeChallengeIdentity(challenge);
+    const freshForMs = Math.min(240000, exp * 1000 - Date.now() - 45000);
+    if (freshForMs <= 0) throw new Error('Sign-in preparation expired. Refresh this page and try again.');
+    signInDeadline = Date.now() + freshForMs;
+    gisInitialized = true;
     window.google.accounts.id.initialize({
       client_id: cfg.clientId,
       nonce,
       auto_select: false,
       callback: async (response) => {
-        if (busy) return;
+        if (generation !== signInGeneration || session || busy || Date.now() >= signInDeadline) {
+          if (response && typeof response.credential === 'string') response.credential = '';
+          if (generation === signInGeneration && !session && !busy) retireSignIn('Sign-in preparation expired. Refresh sign-in to continue.', 'notice');
+          return;
+        }
+        if (signInExpiryTimer !== null) window.clearTimeout(signInExpiryTimer);
+        signInExpiryTimer = null;
         setBusy(true);
         el('google-button').replaceChildren();
+        el('google-button').hidden = true;
         try {
           if (!response || typeof response.credential !== 'string') throw new Error('Google sign-in did not return an identity token.');
-          const data = await sendGame('exchange', { credential: response.credential }, identityChallenge, identityRequestId);
+          const data = await sendGame('exchange', { credential: response.credential }, challenge, requestId);
           if (data.enrollmentNeeded === true) {
             const verifiedSub = document.createElement('code');
             verifiedSub.textContent = data.sub;
@@ -323,24 +362,28 @@ async function beginSignIn() {
           status.dataset.tone = 'error';
         } finally {
           if (response && typeof response.credential === 'string') response.credential = '';
-          identityChallenge = null;
-          identityRequestId = null;
-          el('google-button').replaceChildren();
-          el('sign-in').hidden = Boolean(session);
+          retireSignIn();
           setBusy(false);
         }
       }
     });
-    el('sign-in').hidden = true;
     window.google.accounts.id.renderButton(el('google-button'), { theme: 'outline', size: 'large', shape: 'pill', text: 'signin_with', width: 220 });
+    el('google-button').hidden = false;
+    el('sign-in').hidden = true;
+    signInExpiryTimer = window.setTimeout(() => {
+      if (generation === signInGeneration && !session && !busy) retireSignIn('Sign-in preparation expired. Refresh sign-in to continue.', 'notice');
+    }, freshForMs);
     say('Choose your Google account to continue.', 'neutral');
     setBusy(false);
   } catch (error) {
-    identityChallenge = null;
-    identityRequestId = null;
-    el('google-button').replaceChildren();
-    say(error.message || 'Sign-in could not be started.', 'error');
+    retireSignIn(error.message || 'Sign-in could not be started.', 'error');
     setBusy(false);
+  }
+}
+
+function retireExpiredSignIn() {
+  if (signInDeadline && Date.now() >= signInDeadline && !session && !busy) {
+    retireSignIn('Sign-in preparation expired. Refresh sign-in to continue.', 'notice');
   }
 }
 
@@ -356,6 +399,7 @@ function clearProfile(message) {
   el('sign-out').hidden = true;
   el('refresh-profile').hidden = true;
   el('sign-in').hidden = false;
+  retireSignIn();
   if (message) say(message, 'neutral');
 }
 
@@ -475,15 +519,19 @@ async function loadPublicBoard() {
   }
 }
 
-el('sign-in').addEventListener('click', beginSignIn);
+el('sign-in').addEventListener('click', prepareSignIn);
 el('sign-out').addEventListener('click', signOut);
 el('refresh-profile').addEventListener('click', refreshProfile);
+window.addEventListener('focus', retireExpiredSignIn);
+window.addEventListener('pageshow', retireExpiredSignIn);
+if (typeof document.addEventListener === 'function') document.addEventListener('visibilitychange', retireExpiredSignIn);
 
 if (!validateConfig()) {
   el('sign-in').disabled = true;
   el('sign-in').title = 'Google sign-in has not been configured for this site.';
   say('This community space is being prepared. Please check back soon.', 'notice');
 } else {
-  say('Sign in to open your player profile and shared pages.', 'neutral');
+  say('Preparing Google sign-in…', 'neutral');
+  void prepareSignIn();
 }
 loadPublicBoard();
