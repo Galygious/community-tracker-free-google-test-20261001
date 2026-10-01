@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="light">
+  <title>Public transport diagnostic</title>
+  <style>
+    :root { color-scheme: light; font: 16px/1.5 system-ui, sans-serif; color: #25352e; background: #f4f5ed; }
+    body { max-width: 56rem; margin: 0 auto; padding: 2rem 1rem 4rem; }
+    main { background: #fff; border: 1px solid #d9ded4; border-radius: 1rem; padding: clamp(1.25rem, 4vw, 2.5rem); box-shadow: 0 1rem 3rem #24382c12; }
+    h1 { margin: 0 0 .5rem; font-size: clamp(1.7rem, 5vw, 2.4rem); line-height: 1.15; }
+    p { max-width: 68ch; }
+    .note { padding: .85rem 1rem; border-left: .25rem solid #53745e; background: #eef3eb; }
+    button { min-height: 2.8rem; border: 0; border-radius: .6rem; padding: .65rem 1rem; color: #fff; background: #315c45; font: inherit; font-weight: 650; cursor: pointer; }
+    button:focus-visible { outline: 3px solid #c07828; outline-offset: 3px; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    #state { min-height: 1.5em; }
+    .results { display: grid; gap: 1rem; margin-top: 1.25rem; }
+    article { border: 1px solid #d9ded4; border-radius: .65rem; padding: 1rem; overflow-wrap: anywhere; }
+    article h2 { margin: 0 0 .5rem; font-size: 1.1rem; }
+    pre { margin: 0; white-space: pre-wrap; font: .875rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .muted { color: #53645a; font-size: .9rem; }
+  </style>
+  <script src="config.js"></script>
+</head>
+<body>
+  <main>
+    <h1>Public transport diagnostic</h1>
+    <p class="note"><strong>Public-only check.</strong> This page makes two read-only GET requests after you click the button. It does not sign in or send credentials, ID tokens, or sessions. It reports only transport metadata and parse booleans; it never displays a challenge or response body.</p>
+    <p id="config-state" class="muted" role="status">Checking the public API URL…</p>
+    <button id="run" type="button" disabled>Run public GET checks</button>
+    <p id="state" role="status" aria-live="polite"></p>
+    <section id="results" class="results" aria-label="Diagnostic results"></section>
+  </main>
+  <script>
+    (() => {
+      'use strict';
+      const button = document.getElementById('run');
+      const configState = document.getElementById('config-state');
+      const state = document.getElementById('state');
+      const results = document.getElementById('results');
+      const apiUrl = canonicalApiUrl();
+      configState.textContent = apiUrl ? 'The configured API URL has the expected canonical form.' : 'The configured API URL is missing or is not a canonical Apps Script web-app URL.';
+      button.disabled = !apiUrl;
+
+      function canonicalApiUrl() {
+        try {
+          const raw = window.TRACKER_CONFIG && window.TRACKER_CONFIG.apiUrl;
+          if (typeof raw !== 'string' || raw.length > 512) return null;
+          const url = new URL(raw);
+          if (url.href !== raw || url.origin !== 'https://script.google.com' || url.username || url.password || url.search || url.hash ||
+              !/^\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(url.pathname)) return null;
+          return url;
+        } catch (_) {
+          return null;
+        }
+      }
+
+      function randomRequestId() {
+        if (!window.crypto || typeof window.crypto.getRandomValues !== 'function') throw new Error('Secure random IDs are unavailable.');
+        const bytes = new Uint8Array(24);
+        window.crypto.getRandomValues(bytes);
+        return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+      }
+
+      function parseChallengeJsonp(text) {
+        if (typeof text !== 'string' || text.length > 262144) return false;
+        const match = /^\s*trackerCallback\(([\s\S]*)\);\s*$/.exec(text);
+        if (!match) return false;
+        try {
+          const value = JSON.parse(match[1]);
+          return !!value && typeof value === 'object' && !Array.isArray(value) &&
+            Object.keys(value).length === 1 && typeof value.challenge === 'string' && value.challenge.length > 0;
+        } catch (_) {
+          return false;
+        }
+      }
+
+      function parsePublicArray(text) {
+        if (typeof text !== 'string' || text.length > 262144) return false;
+        try { return Array.isArray(JSON.parse(text)); } catch (_) { return false; }
+      }
+
+      function safeErrorName(error) {
+        return error && typeof error.name === 'string' && /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(error.name) ? error.name : 'Error';
+      }
+
+      async function getDiagnostic(url, parseName, parser) {
+        try {
+          const response = await fetch(url.href, {
+            method: 'GET',
+            credentials: 'omit',
+            mode: 'cors',
+            redirect: 'follow',
+            cache: 'no-store',
+            referrerPolicy: 'no-referrer'
+          });
+          const text = await response.text();
+          const headers = {};
+          for (const name of ['content-type', 'access-control-allow-origin', 'cache-control']) {
+            const value = response.headers.get(name);
+            if (typeof value === 'string' && value.length <= 200 && !/[\r\n]/.test(value)) headers[name] = value;
+          }
+          let finalOrigin = null;
+          try { finalOrigin = new URL(response.url).origin; } catch (_) { /* Keep only the origin field, or null. */ }
+          return {
+            status: response.status,
+            ok: response.ok,
+            redirected: response.redirected,
+            type: response.type,
+            finalOrigin,
+            headers,
+            [parseName]: parser(text)
+          };
+        } catch (error) {
+          return { errorName: safeErrorName(error) };
+        }
+      }
+
+      function showResult(title, value) {
+        const card = document.createElement('article');
+        const heading = document.createElement('h2');
+        heading.textContent = title;
+        const details = document.createElement('pre');
+        details.textContent = JSON.stringify(value, null, 2);
+        card.append(heading, details);
+        results.append(card);
+      }
+
+      button.addEventListener('click', async () => {
+        if (!apiUrl || button.disabled) return;
+        button.disabled = true;
+        results.replaceChildren();
+        state.textContent = 'Running the two public GET checks…';
+        try {
+          const challengeUrl = new URL(apiUrl.href);
+          challengeUrl.searchParams.set('op', 'app.challenge');
+          challengeUrl.searchParams.set('gameOp', 'exchange');
+          challengeUrl.searchParams.set('requestId', randomRequestId());
+          challengeUrl.searchParams.set('callback', 'trackerCallback');
+          showResult('Scoped public challenge GET', await getDiagnostic(challengeUrl, 'challengePresent', parseChallengeJsonp));
+
+          const publicUrl = new URL(apiUrl.href);
+          publicUrl.searchParams.set('op', 'public');
+          showResult('Public projection GET', await getDiagnostic(publicUrl, 'arrayResponse', parsePublicArray));
+          state.textContent = 'Both public GET checks finished. No response body or challenge value was displayed.';
+        } catch (error) {
+          state.textContent = `The diagnostic could not start (${safeErrorName(error)}).`;
+        } finally {
+          button.disabled = !apiUrl;
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
