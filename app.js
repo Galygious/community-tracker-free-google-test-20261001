@@ -11,13 +11,15 @@ async function submit(fields,credential,challenge){
   try{
    const response=await fetch(cfg.apiUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({...fields,credential,challenge}),redirect:'follow'});
    const result=await response.json();status.textContent=JSON.stringify(result,null,2);
+   document.getElementById('google-button').replaceChildren();
+   for(const input of document.getElementById('request').elements)input.disabled=false;
   }catch(e){status.textContent='Response unavailable. A write may have committed. Do not retry blindly; inspect version with a fresh read. Reload before another request.';}
   return;
  }
  const form=document.createElement('form');form.method='POST';form.action=cfg.apiUrl;
  for(const [name,value]of Object.entries({...fields,credential,challenge})){const i=document.createElement('input');i.type='hidden';i.name=name;i.value=value;form.appendChild(i);}document.body.appendChild(form);form.submit();}
 function loadGIS(){return new Promise((resolve,reject)=>{const s=document.createElement('script');s.src='https://accounts.google.com/gsi/client';s.onload=resolve;s.onerror=reject;document.head.appendChild(s);});}
-if(cfg.mode==='google'){document.getElementById('mode').textContent='Google deployment experiment: synthetic data only; development-only tokeninfo verifier.';document.getElementById('identity').parentElement.hidden=true;}
+if(cfg.mode==='google'){document.getElementById('mode').textContent='Google deployment experiment: synthetic data only; development-only tokeninfo verifier.';const identity=document.getElementById('identity');if(identity)identity.parentElement.remove();}
 if(cfg.mode==='offline'){
  document.getElementById('mode').textContent='Synthetic public preview. Google sign-in and the private backend are not connected yet.';
  const p=document.createElement('p');p.textContent='Community garden day - Saturday: bring spare gloves. (synthetic sample)';document.getElementById('public').appendChild(p);
