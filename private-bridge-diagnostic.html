@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="light">
+  <title>Private bridge transport diagnostic</title>
+  <style>
+    :root { color-scheme: light; font: 16px/1.5 system-ui, sans-serif; color: #25352e; background: #f4f5ed; }
+    body { max-width: 52rem; margin: 0 auto; padding: 2rem 1rem 4rem; }
+    main { background: #fff; border: 1px solid #d9ded4; border-radius: 1rem; padding: clamp(1.25rem, 4vw, 2.25rem); box-shadow: 0 1rem 3rem #24382c12; }
+    h1 { margin: 0 0 .5rem; font-size: clamp(1.7rem, 5vw, 2.35rem); line-height: 1.15; }
+    p { max-width: 70ch; }
+    .note { padding: .85rem 1rem; border-left: .25rem solid #53745e; background: #eef3eb; }
+    .actions { display: flex; flex-wrap: wrap; gap: .7rem; margin: 1.25rem 0; }
+    button { min-height: 2.8rem; border: 0; border-radius: .6rem; padding: .65rem 1rem; color: #fff; background: #315c45; font: inherit; font-weight: 650; cursor: pointer; }
+    button:focus-visible { outline: 3px solid #c07828; outline-offset: 3px; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    #state { min-height: 1.5em; }
+    #support { color: #53645a; font-size: .9rem; }
+    .results { display: grid; gap: .8rem; margin-top: 1.25rem; }
+    article { border: 1px solid #d9ded4; border-radius: .65rem; padding: 1rem; overflow-wrap: anywhere; }
+    article h2 { margin: 0 0 .5rem; font-size: 1.05rem; }
+    pre { margin: 0; white-space: pre-wrap; font: .85rem/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+  </style>
+  <script src="config.js"></script>
+  <script src="bridge.js"></script>
+</head>
+<body>
+  <main>
+    <h1>Private bridge transport diagnostic</h1>
+    <p class="note"><strong>Probe only; no sign-in.</strong> Each attempt requests a fresh challenge, then posts an intentionally invalid session. The session string has no dot, so the server rejects it during session verification before nonce consumption or private data access. No real credential, session, profile, challenge value, response body, or frame URL is shown.</p>
+    <p id="support" role="status"></p>
+    <p id="state" role="status" aria-live="polite">Choose one transport mode to start. A maximum of four attempts is allowed on this page.</p>
+    <div class="actions">
+      <button id="ordinary" type="button">Run ordinary iframe POST</button>
+      <button id="credentialless" type="button">Run credentialless iframe POST</button>
+    </div>
+    <section id="results" class="results" aria-label="Safe transport results"></section>
+  </main>
+  <script>
+    (() => {
+      'use strict';
+      const allowedResponseOrigins = new Set(['https://script.google.com', 'https://script.googleusercontent.com']);
+      const maxAttempts = 4;
+      const challengeTimeoutMs = 15000;
+      const responseTimeoutMs = 25000;
+      const apiUrl = canonicalApiUrl();
+      const ordinaryButton = document.getElementById('ordinary');
+      const credentiallessButton = document.getElementById('credentialless');
+      const support = document.getElementById('support');
+      const state = document.getElementById('state');
+      const results = document.getElementById('results');
+      const probeFrame = document.createElement('iframe');
+      const credentiallessSupported = 'credentialless' in probeFrame;
+      let attempts = 0;
+      let activeAttempt = null;
+
+      support.textContent = credentiallessSupported
+        ? 'This browser exposes the iframe credentialless property. The browser’s actual cookie treatment must be confirmed empirically.'
+        : 'Credentialless iframe mode is unsupported in this browser; that control is disabled.';
+      credentiallessButton.disabled = !credentiallessSupported || !apiUrl;
+      ordinaryButton.disabled = !apiUrl;
+      if (!apiUrl) state.textContent = 'The public API URL is not in the expected canonical form; no request can be made.';
+
+      function canonicalApiUrl() {
+        try {
+          const raw = window.TRACKER_CONFIG && window.TRACKER_CONFIG.apiUrl;
+          if (typeof raw !== 'string' || raw.length > 512) return null;
+          const url = new URL(raw);
+          if (url.href !== raw || url.origin !== 'https://script.google.com' || url.username || url.password || url.search || url.hash ||
+              !/^\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(url.pathname)) return null;
+          return url;
+        } catch (_) {
+          return null;
+        }
+      }
+
+      function randomRequestId() {
+        if (!window.crypto || typeof window.crypto.getRandomValues !== 'function') throw new Error('Secure randomness is unavailable.');
+        const bytes = new Uint8Array(24);
+        window.crypto.getRandomValues(bytes);
+        return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+      }
+
+      function readChallengeResponse(response) {
+        const contentType = (response.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
+        if (contentType !== 'text/javascript') throw new Error('Unexpected response type.');
+        const finalOrigin = new URL(response.url).origin;
+        if (!allowedResponseOrigins.has(finalOrigin)) throw new Error('Unexpected response origin.');
+        const contentLength = response.headers.get('content-length');
+        if (contentLength !== null && (!/^\d+$/.test(String(contentLength).trim()) || Number(contentLength) > 65536)) {
+          throw new Error('Unexpected response size.');
+        }
+        return response.text().then((text) => {
+          if (typeof text !== 'string' || new TextEncoder().encode(text).byteLength > 65536) throw new Error('Unexpected response size.');
+          const match = /^\s*trackerCallback\((\{[\s\S]*\})\);\s*$/.exec(text);
+          if (!match) throw new Error('Unexpected challenge response.');
+          const payload = JSON.parse(match[1]);
+          if (!payload || typeof payload !== 'object' || Array.isArray(payload) || Object.keys(payload).length !== 1 ||
+              typeof payload.challenge !== 'string' || !payload.challenge || payload.challenge.length > 2048) {
+            throw new Error('Unexpected challenge response.');
+          }
+          return payload.challenge;
+        });
+      }
+
+      function freshChallenge(requestId) {
+        const url = new URL(apiUrl.href);
+        url.searchParams.set('op', 'app.challenge');
+        url.searchParams.set('gameOp', 'profile');
+        url.searchParams.set('requestId', requestId);
+        url.searchParams.set('callback', 'trackerCallback');
+        return new Promise((resolve, reject) => {
+          if (typeof AbortController !== 'function') return reject(new Error('AbortController is unavailable.'));
+          const controller = new AbortController();
+          let timer = null;
+          let settled = false;
+          const finish = (error, value) => {
+            if (settled) return;
+            settled = true;
+            if (timer !== null) window.clearTimeout(timer);
+            if (error) reject(error); else resolve(value);
+          };
+          timer = window.setTimeout(() => {
+            controller.abort();
+            finish(new Error('Challenge request timed out.'));
+          }, challengeTimeoutMs);
+          Promise.resolve().then(() => window.fetch(url.href, {
+            method: 'GET',
+            credentials: 'omit',
+            mode: 'cors',
+            redirect: 'follow',
+            cache: 'no-store',
+            referrerPolicy: 'no-referrer',
+            signal: controller.signal
+          })).then((response) => {
+            if (!response || !response.ok) throw new Error('Challenge request failed.');
+            return readChallengeResponse(response);
+          }).then((challenge) => finish(null, challenge)).catch(() => {
+            if (!settled) finish(new Error('Challenge request failed.'));
+          });
+        });
+      }
+
+      function exactResponseEnvelope(message, requestId) {
+        if (!message || typeof message !== 'object' || Array.isArray(message) || message.type !== 'tracker-response' ||
+            message.v !== 1 || message.requestId !== requestId || typeof message.ok !== 'boolean') return false;
+        const keys = message.ok ? ['type', 'v', 'requestId', 'ok', 'data'] : ['type', 'v', 'requestId', 'ok', 'error'];
+        return Object.keys(message).length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(message, key));
+      }
+
+      function safeOrigin(origin) {
+        return typeof origin === 'string' ? origin.slice(0, 200) : '';
+      }
+
+      function safeErrorCode(message) {
+        return typeof message.error === 'string' && /^[A-Z_]{1,40}$/.test(message.error) ? message.error : null;
+      }
+
+      function resultRecord(entry, values) {
+        return Object.assign({
+          mode: entry.mode,
+          credentiallessSupported,
+          iframeLoadCount: entry.loadCount
+        }, values || {});
+      }
+
+      function showResult(record) {
+        const article = document.createElement('article');
+        const heading = document.createElement('h2');
+        heading.textContent = `Attempt ${attempts}: ${record.mode}`;
+        const pre = document.createElement('pre');
+        pre.textContent = JSON.stringify(record, null, 2);
+        article.append(heading, pre);
+        results.append(article);
+      }
+
+      function updateButtons() {
+        const disabled = Boolean(activeAttempt) || attempts >= maxAttempts || !apiUrl;
+        ordinaryButton.disabled = disabled;
+        credentiallessButton.disabled = disabled || !credentiallessSupported;
+      }
+
+      function cleanup(entry) {
+        if (entry.timer !== null) window.clearTimeout(entry.timer);
+        if (entry.form) entry.form.remove();
+        if (entry.frame) entry.frame.remove();
+        if (activeAttempt === entry) activeAttempt = null;
+        updateButtons();
+      }
+
+      function finishAttempt(entry, record) {
+        if (activeAttempt !== entry) return;
+        cleanup(entry);
+        showResult(record);
+        state.textContent = attempts >= maxAttempts
+          ? 'This page has reached its four-attempt limit. Reload to begin a new bounded diagnostic session.'
+          : 'Attempt finished. Choose a transport mode to run another probe.';
+      }
+
+      function handleMessage(event) {
+        const entry = activeAttempt;
+        if (!entry || !entry.frame || !entry.requestId || !exactResponseEnvelope(event.data, entry.requestId)) return;
+        const sourceAncestry = window.TrackerBridge.sourceDescendsFrom(event.source, entry.frame.contentWindow);
+        if (!sourceAncestry) return;
+        const bridgeAccepts = window.TrackerBridge.accepts(event, entry);
+        const message = event.data;
+        const safe = {
+          eventOrigin: safeOrigin(event.origin),
+          sourceAncestry,
+          bridgeAccepts,
+          ok: message.ok,
+          errorCode: message.ok ? null : safeErrorCode(message)
+        };
+        if (!bridgeAccepts) {
+          entry.lastRejected = safe;
+          return;
+        }
+        finishAttempt(entry, resultRecord(entry, safe));
+      }
+
+      window.addEventListener('message', handleMessage);
+
+      function submitProbe(entry, challenge) {
+        const frame = document.createElement('iframe');
+        frame.name = `private-probe-${attempts}-${entry.requestId}`;
+        frame.title = 'Hidden private bridge diagnostic response';
+        frame.hidden = true;
+        frame.tabIndex = -1;
+        frame.setAttribute('aria-hidden', 'true');
+        if (entry.mode === 'credentialless') {
+          if (!('credentialless' in frame)) throw new Error('Credentialless iframe support is unavailable.');
+          frame.credentialless = true;
+          frame.setAttribute('credentialless', '');
+          if (frame.credentialless !== true) throw new Error('Credentialless iframe mode could not be set.');
+        }
+        const form = document.createElement('form');
+        form.method = 'POST';
+        form.enctype = 'application/x-www-form-urlencoded';
+        form.action = apiUrl.href;
+        form.target = frame.name;
+        form.hidden = true;
+        const fields = {
+          app: 'game',
+          gameOp: 'profile',
+          requestId: entry.requestId,
+          challenge,
+          session: `invalid-probe-session-v1-${entry.requestId}`
+        };
+        const inputs = [];
+        for (const [name, value] of Object.entries(fields)) {
+          const input = document.createElement('input');
+          input.type = 'hidden';
+          input.name = name;
+          input.value = value;
+          form.appendChild(input);
+          inputs.push(input);
+        }
+        entry.frame = frame;
+        entry.form = form;
+        frame.addEventListener('load', () => { entry.loadCount += 1; });
+        entry.timer = window.setTimeout(() => {
+          const base = resultRecord(entry, { result: 'timeout' });
+          const details = entry.lastRejected ? Object.assign(base, entry.lastRejected) : base;
+          finishAttempt(entry, details);
+        }, responseTimeoutMs);
+        document.body.append(frame, form);
+        try {
+          form.submit();
+          for (const input of inputs) {
+            input.value = '';
+            input.remove();
+          }
+          fields.challenge = '';
+          fields.session = '';
+          challenge = '';
+        } catch (_) {
+          for (const input of inputs) {
+            input.value = '';
+            input.remove();
+          }
+          finishAttempt(entry, resultRecord(entry, { result: 'submit-failed' }));
+        }
+      }
+
+      async function run(mode) {
+        if (activeAttempt || attempts >= maxAttempts || !apiUrl) return;
+        if (mode === 'credentialless' && !credentiallessSupported) return;
+        attempts += 1;
+        const entry = {
+          mode,
+          requestId: null,
+          frame: null,
+          form: null,
+          timer: null,
+          loadCount: 0,
+          lastRejected: null
+        };
+        activeAttempt = entry;
+        updateButtons();
+        state.textContent = `Attempt ${attempts} of ${maxAttempts}: requesting a fresh public challenge…`;
+        try {
+          entry.requestId = randomRequestId();
+          const challenge = await freshChallenge(entry.requestId);
+          if (activeAttempt !== entry) return;
+          state.textContent = `Attempt ${attempts} of ${maxAttempts}: waiting for the invalid-session response…`;
+          submitProbe(entry, challenge);
+        } catch (_) {
+          finishAttempt(entry, resultRecord(entry, { stage: 'challenge', result: 'unavailable' }));
+        }
+      }
+
+      ordinaryButton.addEventListener('click', () => { void run('ordinary'); });
+      credentiallessButton.addEventListener('click', () => { void run('credentialless'); });
+      updateButtons();
+    })();
+  </script>
+</body>
+</html>
