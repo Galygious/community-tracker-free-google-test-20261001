@@ -4,6 +4,8 @@ window.TrackerBridge = Object.freeze((function () {
     'https://script.google.com',
     'https://script.googleusercontent.com'
   ]);
+  // HtmlService's observed sandbox host for this deployment uses a rotating numeric slot.
+  const deploymentSandboxOrigin = /^https:\/\/n-hrjbb2f33wsvmz3xxpvdar2c6sfxx5houayxibi-[0-9]+lu-script\.googleusercontent\.com$/;
 
   function sourceDescendsFrom(source, target) {
     if (!source || !target) return false;
@@ -23,7 +25,8 @@ window.TrackerBridge = Object.freeze((function () {
   }
 
   function accepts(event, pending) {
-    if (!event || !pending || !pending.frame || !allowedOrigins.has(event.origin)) return false;
+    if (!event || !pending || !pending.frame ||
+        (!allowedOrigins.has(event.origin) && !deploymentSandboxOrigin.test(event.origin))) return false;
     const message = event.data;
     if (!message || typeof message !== 'object' || Array.isArray(message)) return false;
     if (message.type !== 'tracker-response' || message.v !== 1 || message.requestId !== pending.requestId || typeof message.ok !== 'boolean') return false;
