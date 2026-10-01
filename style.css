@@ -112,6 +112,8 @@ h2 { margin: 0; font-size: clamp(1.55rem, 3vw, 2.05rem); letter-spacing: -.04em;
 .page-preview { margin-top: 13px; padding: 20px 22px; background: #fffefa; border: 1px solid #cfd9ca; border-left: 4px solid var(--gold); border-radius: 10px; }
 .page-preview h3 { margin-bottom: 5px; }
 .page-preview p { margin: 0; color: var(--muted); }
+.private-page-frame { display: block; width: 100%; height: min(72vh, 820px); min-height: 380px; margin-top: 14px; border: 1px solid var(--line); border-radius: 9px; background: #fffefa; }
+.private-page-frame:focus-visible { outline: 3px solid #ad741b; outline-offset: 2px; }
 
 footer { max-width: 1190px; min-height: 91px; margin: 0 auto; padding: 24px 28px; display: flex; align-items: center; gap: 22px; color: var(--muted); font-size: .8rem; }
 .footer-brand { font-size: .95rem; }
@@ -135,6 +137,7 @@ footer > a:last-child { margin-left: auto; font-weight: 650; }
   .section-note { display: none; }
   .player-grid { grid-template-columns: 1fr; }
   .account-card, .shared-pages { padding: 18px; }
+  .private-page-frame { height: min(72vh, 760px); min-height: 330px; }
   footer { padding: 22px 18px; flex-wrap: wrap; gap: 10px 16px; }
   footer > span { order: 3; width: 100%; }
 }

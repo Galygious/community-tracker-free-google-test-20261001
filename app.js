@@ -4,7 +4,7 @@ const el = (id) => document.getElementById(id);
 const status = el('status');
 const allowedApiOrigins = new Set(['https://script.google.com']);
 const allowedPublicResponseOrigins = new Set(['https://script.google.com', 'https://script.googleusercontent.com']);
-const allowedChallengeOps = new Set(['exchange', 'profile', 'logout']);
+const allowedChallengeOps = new Set(['exchange', 'profile', 'logout', 'page.get', 'data.get', 'data.write']);
 const publicResponseLimit = 512 * 1024;
 let session = null;
 let gisPromise = null;
@@ -13,6 +13,10 @@ let signInGeneration = 0;
 let signInDeadline = 0;
 let signInExpiryTimer = null;
 let busy = false;
+let currentRole = null;
+let pageLoadSerial = 0;
+let pageLoadController = null;
+let availablePages = [];
 const pending = new Map();
 
 function say(message, tone) {
@@ -36,6 +40,10 @@ function randomRequestId() {
   const bytes = new Uint8Array(24);
   window.crypto.getRandomValues(bytes);
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function abortError() {
+  return Object.assign(new Error('This page request was cancelled.'), { code: 'ABORTED' });
 }
 
 function publicGetUrl(kind, gameOp, requestId) {
@@ -62,10 +70,6 @@ function publicGetUrl(kind, gameOp, requestId) {
 
 function publicGetError(message, code) {
   return Object.assign(new Error(message), { code });
-}
-
-function publicGetAbortError() {
-  return publicGetError('This request was cancelled.', 'ABORTED');
 }
 
 async function readBoundedPublicText(response) {
@@ -120,10 +124,14 @@ function parsePublicGetText(kind, text) {
   throw new Error('The community service is unavailable.');
 }
 
-function fetchPublicGet(kind, gameOp, requestId) {
+function fetchPublicGet(kind, gameOp, requestId, signal) {
   let url;
   try { url = publicGetUrl(kind, gameOp, requestId); }
   catch (error) { return Promise.reject(error); }
+  if (signal && signal.aborted) return Promise.reject(abortError());
+  if (signal && (typeof signal.addEventListener !== 'function' || typeof signal.removeEventListener !== 'function')) {
+    return Promise.reject(new Error('The community request could not be started.'));
+  }
   return new Promise((resolve, reject) => {
     if (typeof AbortController !== 'function') return reject(new Error('This browser cannot securely contact the community service.'));
     const controller = new AbortController();
@@ -134,8 +142,17 @@ function fetchPublicGet(kind, gameOp, requestId) {
       if (settled) return;
       settled = true;
       if (timer !== null) window.clearTimeout(timer);
+      if (signal && abortListener) signal.removeEventListener('abort', abortListener);
       if (error) reject(error); else resolve(result);
     };
+    const abortListener = signal ? () => {
+      controller.abort();
+      finish(abortError());
+    } : null;
+    if (signal) {
+      signal.addEventListener('abort', abortListener, { once: true });
+      if (signal.aborted) { abortListener(); return; }
+    }
     timer = window.setTimeout(() => {
       timedOut = true;
       controller.abort();
@@ -159,17 +176,18 @@ function fetchPublicGet(kind, gameOp, requestId) {
       return parsePublicGetText(kind, await readBoundedPublicText(response));
     }).then((result) => finish(null, result)).catch(() => {
       if (timedOut) return;
-      finish(new Error('The community service is unavailable.'));
+      if (signal && signal.aborted) finish(abortError());
+      else finish(new Error('The community service is unavailable.'));
     });
   });
 }
 
-async function getChallenge(gameOp, requestId) {
-  return fetchPublicGet('challenge', gameOp, requestId);
+async function getChallenge(gameOp, requestId, signal) {
+  return fetchPublicGet('challenge', gameOp, requestId, signal);
 }
 
-async function getPublicRows() {
-  return fetchPublicGet('public');
+async function getPublicRows(signal) {
+  return fetchPublicGet('public', undefined, undefined, signal);
 }
 
 function acceptedOrigin(event) {
@@ -178,13 +196,15 @@ function acceptedOrigin(event) {
 
 function clearPending(requestId, entry) {
   if (entry.timer) window.clearTimeout(entry.timer);
+  if (entry.signal && entry.abortListener) entry.signal.removeEventListener('abort', entry.abortListener);
   pending.delete(requestId);
   if (entry.form) entry.form.remove();
   if (entry.frame) entry.frame.remove();
 }
 
-function postBridge(gameOp, requestId, challenge, values) {
+function postBridge(gameOp, requestId, challenge, values, signal) {
   return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) return reject(abortError());
     const frame = document.createElement('iframe');
     frame.name = `tracker-response-${requestId}`;
     frame.title = 'Secure community response';
@@ -205,11 +225,18 @@ function postBridge(gameOp, requestId, challenge, values) {
       input.value = value;
       form.appendChild(input);
     }
-    const entry = { requestId, frame, form, resolve, reject, timer: null };
+    const entry = { requestId, frame, form, resolve, reject, timer: null, signal, abortListener: null };
     entry.timer = window.setTimeout(() => {
       clearPending(requestId, entry);
-      reject(new Error('The response timed out. Check your connection and try again.'));
+      reject(Object.assign(new Error('The response timed out. Check your connection and try again.'), { code: 'TIMEOUT' }));
     }, 25000);
+    if (signal) {
+      entry.abortListener = () => {
+        clearPending(requestId, entry);
+        reject(abortError());
+      };
+      signal.addEventListener('abort', entry.abortListener, { once: true });
+    }
     pending.set(requestId, entry);
     document.body.append(frame, form);
     try {
@@ -235,10 +262,15 @@ window.addEventListener('message', (event) => {
   else entry.reject(Object.assign(new Error(friendlyError(message.error)), { code: message.error }));
 });
 
-async function sendGame(gameOp, values, fixedChallenge, fixedRequestId) {
+window.addEventListener('message', (event) => {
+  if (window.TrackerPageFrame) window.TrackerPageFrame.handleMessage(event);
+});
+
+async function sendGame(gameOp, values, fixedChallenge, fixedRequestId, signal) {
   const requestId = fixedRequestId || randomRequestId();
-  const challenge = fixedChallenge || await getChallenge(gameOp, requestId);
-  return postBridge(gameOp, requestId, challenge, values);
+  const challenge = fixedChallenge || await getChallenge(gameOp, requestId, signal);
+  if (signal && signal.aborted) throw abortError();
+  return postBridge(gameOp, requestId, challenge, values, signal);
 }
 
 function friendlyError(code) {
@@ -250,6 +282,7 @@ function friendlyError(code) {
     SESSION_REVOKED: 'You have signed out. Sign in again to continue.',
     DEMO_DISABLED: 'The community app is temporarily unavailable.',
     STORAGE_UNAVAILABLE: 'The community app is temporarily unavailable.',
+    PAGE_UNAVAILABLE: 'This shared page is temporarily unavailable.',
     BUSY: 'The community service is busy. Please try again shortly.'
   };
   return messages[code] || 'Something went wrong. Please try again.';
@@ -388,7 +421,10 @@ function retireExpiredSignIn() {
 }
 
 function clearProfile(message) {
+  clearPage();
   session = null;
+  currentRole = null;
+  availablePages = [];
   el('account-badge').textContent = 'Signed out';
   el('account-name').textContent = 'Your profile is waiting';
   el('account-detail').textContent = 'Sign in with Google to open your player profile and the pages shared with your role.';
@@ -405,9 +441,12 @@ function clearProfile(message) {
 
 async function loadProfile() {
   if (!session) return;
+  clearPage();
   const data = await sendGame('profile', { session });
-  if (!data.profile || typeof data.profile.displayName !== 'string' || !Array.isArray(data.pages)) throw new Error('Your profile response was incomplete.');
+  if (!data.profile || typeof data.profile.displayName !== 'string' || !['reader', 'member', 'moderator'].includes(data.profile.role) || !Array.isArray(data.pages)) throw new Error('Your profile response was incomplete.');
   const { profile, pages } = data;
+  currentRole = profile.role;
+  availablePages = pages;
   el('account-name').textContent = profile.displayName;
   el('account-detail').textContent = 'Your community profile and currently available pages.';
   el('account-badge').textContent = 'Signed in';
@@ -435,22 +474,136 @@ async function loadProfile() {
     action.className = 'page-card-action';
     action.textContent = 'View page';
     button.append(title, action);
-    button.addEventListener('click', () => showPage(page));
+    button.addEventListener('click', () => navigateToPage(page.id));
     el('page-list').append(button);
   }
   say('Your profile is up to date.', 'success');
+  const requestedPage = hashPageId();
+  if (requestedPage !== null) void openPage(requestedPage);
 }
 
-function showPage(page) {
+function clearPage() {
+  pageLoadSerial += 1;
+  if (pageLoadController) pageLoadController.abort();
+  pageLoadController = null;
+  if (window.TrackerPageFrame) window.TrackerPageFrame.clear();
+  const preview = el('page-preview');
+  preview.hidden = true;
+  preview.replaceChildren();
+}
+
+function previewMessage(title, message) {
   const preview = el('page-preview');
   const heading = document.createElement('h3');
-  heading.textContent = page.title;
-  const message = document.createElement('p');
-  message.textContent = 'This page is ready for your player space. Its shared content will be available soon.';
-  preview.replaceChildren(heading, message);
+  heading.textContent = title;
+  const copy = document.createElement('p');
+  copy.textContent = message;
+  preview.replaceChildren(heading, copy);
   preview.hidden = false;
   preview.focus({ preventScroll: true });
   preview.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'nearest' });
+}
+
+function hashPageId() {
+  const match = window.location.hash.match(/^#page=(.*)$/);
+  if (!match) return null;
+  try { return decodeURIComponent(match[1]); } catch (_) { return match[1]; }
+}
+
+function navigateToPage(pageId) {
+  const hash = `#page=${encodeURIComponent(pageId)}`;
+  if (window.location.hash === hash) void openPage(pageId);
+  else window.location.hash = hash;
+}
+
+async function openPage(pageId) {
+  const requestSerial = ++pageLoadSerial;
+  if (pageLoadController) pageLoadController.abort();
+  const controller = new AbortController();
+  pageLoadController = controller;
+  if (window.TrackerPageFrame) window.TrackerPageFrame.clear();
+  const page = availablePages.find((candidate) => candidate && candidate.id === pageId);
+  const displayTitle = page && typeof page.title === 'string' ? page.title : 'Shared player page';
+  if (!session) {
+    previewMessage(displayTitle, 'Sign in with your Google account to request this page.');
+    if (pageLoadController === controller) pageLoadController = null;
+    return;
+  }
+  previewMessage(displayTitle, 'Loading this shared page…');
+  const activeSession = session;
+  try {
+    const result = await sendGame('page.get', { session: activeSession, pageId }, null, null, controller.signal);
+    if (controller.signal.aborted || requestSerial !== pageLoadSerial || session !== activeSession) return;
+    if (!result || result.id !== pageId || typeof result.title !== 'string' || typeof result.html !== 'string') throw new Error('The shared page response was incomplete.');
+    const preview = el('page-preview');
+    const heading = document.createElement('h3');
+    heading.textContent = result.title;
+    preview.replaceChildren(heading);
+    preview.hidden = false;
+    preview.focus({ preventScroll: true });
+    window.TrackerPageFrame.mount(preview, {
+      html: result.html,
+      title: `${result.title} shared page`,
+      canEdit: currentRole === 'member' || currentRole === 'moderator',
+      onRequest: (method, args, signal) => handlePageRequest(pageId, method, args, signal),
+      onNavigate: () => {
+        if (requestSerial === pageLoadSerial) previewMessage(result.title, 'This shared page navigated away. Reopen it from your available pages if needed.');
+      }
+    });
+    say('The shared page is open.', 'success');
+  } catch (error) {
+    if (controller.signal.aborted || requestSerial !== pageLoadSerial || session !== activeSession) return;
+    if (error.code === 'INVALID_SESSION' || error.code === 'SESSION_REVOKED') {
+      clearProfile('Your player session has ended. Sign in again to continue.');
+      return;
+    }
+    previewMessage(displayTitle, error.code === 'DENIED' ? 'Your account does not have access to this page.' : friendlyError(error.code) || 'This shared page could not be opened.');
+    say(error.message || 'This shared page could not be opened.', 'error');
+  } finally {
+    if (pageLoadController === controller) pageLoadController = null;
+  }
+}
+
+function exactKeys(value, keys) {
+  return !!value && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).length === keys.length && keys.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+async function handlePageRequest(pageId, method, args, signal) {
+  const activeSession = session;
+  if (!activeSession || !args || typeof args !== 'object' || Array.isArray(args)) throw Object.assign(new Error('Your session has ended.'), { code: 'INVALID_SESSION' });
+  let operation;
+  let values;
+  if (method === 'profile.read' && exactKeys(args, [])) {
+    operation = 'data.get';
+    values = { session: activeSession, pageId };
+  } else if (method === 'profile.saveGoal' && exactKeys(args, ['goal', 'expectedVersion']) && typeof args.goal === 'string' && Number.isInteger(args.expectedVersion)) {
+    operation = 'data.write';
+    values = { session: activeSession, pageId, currentGoal: args.goal, expectedVersion: String(args.expectedVersion) };
+  } else if (method === 'moderationQueue.list' && exactKeys(args, [])) {
+    operation = 'data.get';
+    values = { session: activeSession, pageId };
+  } else if (method === 'moderationQueue.setStatus' && exactKeys(args, ['id', 'status', 'expectedVersion']) && typeof args.id === 'string' &&
+      ['open', 'resolved'].includes(args.status) && Number.isInteger(args.expectedVersion)) {
+    operation = 'data.write';
+    values = { session: activeSession, pageId, objectId: args.id, status: args.status, expectedVersion: String(args.expectedVersion) };
+  } else {
+    throw Object.assign(new Error('This page action is not available.'), { code: 'BAD_REQUEST' });
+  }
+  try {
+    const result = await sendGame(operation, values, null, null, signal);
+    if (session !== activeSession) throw Object.assign(new Error('Your session has ended.'), { code: 'INVALID_SESSION' });
+    if (method === 'profile.read' || method === 'profile.saveGoal') {
+      if (!result || !result.profile) throw Object.assign(new Error('The profile response was incomplete.'), { code: 'UNAVAILABLE' });
+      return result.profile;
+    }
+    if (method === 'moderationQueue.list') return result.queue;
+    return result.item;
+  } catch (error) {
+    if (error.code === 'TIMEOUT' && operation === 'data.write') error.code = 'REQUEST_UNCERTAIN';
+    if (error.code === 'INVALID_SESSION' || error.code === 'SESSION_REVOKED') clearProfile('Your player session has ended. Sign in again to continue.');
+    throw error;
+  }
 }
 
 async function refreshProfile() {
@@ -525,6 +678,12 @@ el('refresh-profile').addEventListener('click', refreshProfile);
 window.addEventListener('focus', retireExpiredSignIn);
 window.addEventListener('pageshow', retireExpiredSignIn);
 if (typeof document.addEventListener === 'function') document.addEventListener('visibilitychange', retireExpiredSignIn);
+window.addEventListener('hashchange', () => {
+  const pageId = hashPageId();
+  if (pageId === null) clearPage();
+  else if (session) void openPage(pageId);
+  else previewMessage('Shared player page', 'Sign in with your Google account to request this page.');
+});
 
 if (!validateConfig()) {
   el('sign-in').disabled = true;

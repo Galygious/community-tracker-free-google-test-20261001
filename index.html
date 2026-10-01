@@ -6,10 +6,11 @@
   <meta name="referrer" content="no-referrer">
   <meta name="theme-color" content="#f4f5ed">
   <title>Hearthside | Community tracker</title>
-  <link rel="stylesheet" href="style.css?v=gis-ready-1">
+  <link rel="stylesheet" href="style.css?v=private-pages-1">
   <script src="config.js" defer></script>
   <script src="bridge.js?v=observed-origin-1" defer></script>
-  <script src="app.js?v=gis-ready-1" defer></script>
+  <script src="page-frame.js" defer></script>
+  <script src="app.js?v=private-pages-1" defer></script>
 </head>
 <body>
   <header class="site-header">
@@ -44,7 +45,7 @@
         <div class="shared-pages"><div class="pages-heading"><h3>Pages for you</h3><span id="role-chip" class="role-chip" hidden></span></div><div id="page-list" class="page-list"><p class="empty-state">Your available pages will appear here after you sign in.</p></div></div>
       </div>
       <p id="status" class="status" role="status" aria-live="polite"></p>
-      <div id="page-preview" class="page-preview" tabindex="-1" hidden></div>
+      <div id="page-preview" class="page-preview" tabindex="-1" role="region" aria-label="Selected shared page" hidden></div>
     </section>
   </main>
   <footer><a class="brand footer-brand" href="#home"><span class="brand-mark" aria-hidden="true">✳</span> Hearthside</a><span>Made for the people who make the game.</span><a href="#board">Back to the board ↑</a></footer>
