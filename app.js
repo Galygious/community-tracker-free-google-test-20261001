@@ -3,7 +3,9 @@ const cfg = window.TRACKER_CONFIG || {};
 const el = (id) => document.getElementById(id);
 const status = el('status');
 const allowedApiOrigins = new Set(['https://script.google.com']);
-let jsonpBusy = false;
+const allowedPublicResponseOrigins = new Set(['https://script.google.com', 'https://script.googleusercontent.com']);
+const allowedChallengeOps = new Set(['exchange', 'profile', 'logout']);
+const publicResponseLimit = 512 * 1024;
 let session = null;
 let identityChallenge = null;
 let identityRequestId = null;
@@ -34,33 +36,138 @@ function randomRequestId() {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-function jsonp(params) {
-  return new Promise((resolve, reject) => {
-    if (jsonpBusy) return reject(new Error('A request is already in progress.'));
-    jsonpBusy = true;
-    const script = document.createElement('script');
-    const url = new URL(cfg.apiUrl);
-    for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
-    url.searchParams.set('callback', 'trackerCallback');
-    const timer = window.setTimeout(() => finish(new Error('The community service did not respond.')), 15000);
-    function finish(error, result) {
-      window.clearTimeout(timer);
-      script.remove();
-      delete window.trackerCallback;
-      jsonpBusy = false;
-      if (error) reject(error); else resolve(result);
+function publicGetUrl(kind, gameOp, requestId) {
+  if (typeof cfg.apiUrl !== 'string') throw new Error('The community service is unavailable.');
+  const url = new URL(cfg.apiUrl);
+  if (url.href !== cfg.apiUrl || url.origin !== 'https://script.google.com' || url.username || url.password || url.search || url.hash ||
+      !/^\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(url.pathname)) throw new Error('The community service is unavailable.');
+  if (kind === 'challenge') {
+    if (!allowedChallengeOps.has(gameOp) || typeof requestId !== 'string' || !/^[0-9a-f]{48}$/.test(requestId)) {
+      throw new Error('A secure request could not be prepared. Please try again.');
     }
-    window.trackerCallback = (result) => finish(null, result);
-    script.src = url.href;
-    script.onerror = () => finish(new Error('The community service is unavailable.'));
-    document.head.appendChild(script);
+    url.searchParams.set('op', 'app.challenge');
+    url.searchParams.set('gameOp', gameOp);
+    url.searchParams.set('requestId', requestId);
+    url.searchParams.set('callback', 'trackerCallback');
+    return url;
+  }
+  if (kind === 'public' && gameOp === undefined && requestId === undefined) {
+    url.searchParams.set('op', 'public');
+    return url;
+  }
+  throw new Error('The community service is unavailable.');
+}
+
+function publicGetError(message, code) {
+  return Object.assign(new Error(message), { code });
+}
+
+function publicGetAbortError() {
+  return publicGetError('This request was cancelled.', 'ABORTED');
+}
+
+async function readBoundedPublicText(response) {
+  const contentLength = response.headers.get('content-length');
+  if (contentLength !== null) {
+    const normalized = String(contentLength).trim();
+    if (!/^\d+$/.test(normalized) || Number(normalized) > publicResponseLimit) throw new Error('Oversized public response.');
+  }
+  if (response.body && typeof response.body.getReader === 'function') {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    let byteLength = 0;
+    let text = '';
+    try {
+      while (true) {
+        const part = await reader.read();
+        if (part.done) break;
+        byteLength += part.value.byteLength;
+        if (byteLength > publicResponseLimit) {
+          try { await reader.cancel(); } catch (_) { /* Stop an oversized response best-effort. */ }
+          throw new Error('Oversized public response.');
+        }
+        text += decoder.decode(part.value, { stream: true });
+      }
+      return text + decoder.decode();
+    } catch (error) {
+      try { await reader.cancel(); } catch (_) { /* The response may already be aborted or closed. */ }
+      throw error;
+    }
+  }
+  const text = await response.text();
+  if (typeof text !== 'string' || new TextEncoder().encode(text).byteLength > publicResponseLimit) throw new Error('Oversized public response.');
+  return text;
+}
+
+function parsePublicGetText(kind, text) {
+  if (kind === 'challenge') {
+    const match = /^\s*trackerCallback\((\{[\s\S]*\})\);\s*$/.exec(text);
+    if (!match) throw new Error('Unexpected challenge response.');
+    const result = JSON.parse(match[1]);
+    if (!result || typeof result !== 'object' || Array.isArray(result) || Object.keys(result).length !== 1 ||
+        typeof result.challenge !== 'string' || !result.challenge || result.challenge.length > 2048) {
+      throw new Error('Unexpected challenge response.');
+    }
+    return result.challenge;
+  }
+  if (kind === 'public') {
+    const result = JSON.parse(text);
+    if (!Array.isArray(result)) throw new Error('Unexpected community board response.');
+    return result;
+  }
+  throw new Error('The community service is unavailable.');
+}
+
+function fetchPublicGet(kind, gameOp, requestId) {
+  let url;
+  try { url = publicGetUrl(kind, gameOp, requestId); }
+  catch (error) { return Promise.reject(error); }
+  return new Promise((resolve, reject) => {
+    if (typeof AbortController !== 'function') return reject(new Error('This browser cannot securely contact the community service.'));
+    const controller = new AbortController();
+    let settled = false;
+    let timedOut = false;
+    let timer = null;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) window.clearTimeout(timer);
+      if (error) reject(error); else resolve(result);
+    };
+    timer = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      finish(publicGetError('The community service did not respond.', 'PUBLIC_GET_TIMEOUT'));
+    }, 15000);
+    Promise.resolve().then(() => window.fetch(url.href, {
+      method: 'GET',
+      credentials: 'omit',
+      mode: 'cors',
+      redirect: 'follow',
+      cache: 'no-store',
+      referrerPolicy: 'no-referrer',
+      signal: controller.signal
+    })).then(async (response) => {
+      if (!response || !response.ok) throw new Error('The community service is unavailable.');
+      const finalOrigin = new URL(response.url).origin;
+      if (!allowedPublicResponseOrigins.has(finalOrigin)) throw new Error('Unexpected community service response origin.');
+      const mediaType = (response.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
+      const expectedType = kind === 'challenge' ? 'text/javascript' : 'application/json';
+      if (mediaType !== expectedType) throw new Error('Unexpected community service response type.');
+      return parsePublicGetText(kind, await readBoundedPublicText(response));
+    }).then((result) => finish(null, result)).catch(() => {
+      if (timedOut) return;
+      finish(new Error('The community service is unavailable.'));
+    });
   });
 }
 
 async function getChallenge(gameOp, requestId) {
-  const response = await jsonp({ op: 'app.challenge', gameOp, requestId });
-  if (!response || typeof response.challenge !== 'string') throw new Error('A secure request could not be prepared. Please try again.');
-  return response.challenge;
+  return fetchPublicGet('challenge', gameOp, requestId);
+}
+
+async function getPublicRows() {
+  return fetchPublicGet('public');
 }
 
 function acceptedOrigin(event) {
@@ -335,7 +442,7 @@ async function signOut() {
 
 async function loadPublicBoard() {
   try {
-    const items = await jsonp({ op: 'public' });
+    const items = await getPublicRows();
     if (!Array.isArray(items)) throw new Error('The community board is unavailable.');
     const board = el('public-board');
     board.replaceChildren();
