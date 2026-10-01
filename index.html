@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer"><title>Community tracker lab</title><link rel="stylesheet" href="style.css"><script src="config.js" defer></script><script src="app.js" defer></script></head>
+<body><main><p class="eyebrow">COMMUNITY TRACKER / SECURITY LAB</p><h1>A small garden, a private notebook.</h1><p id="mode">Synthetic data only. No live Google connection.</p>
+<section><h2>Public board</h2><div id="public"></div></section>
+<section><h2>Private record request</h2><p>The server decides access. The response opens as a separate result page.</p>
+<form id="request"><label>Synthetic example identity<select id="identity"><option value="alice">Alice: member</option><option value="bob">Bob: member</option><option value="narwhal">Synthetic moderator</option><option value="outsider">Outsider: authenticated, unauthorized</option><option value="revoked">Revoked member</option><option value="reader">Reader: read-only member</option></select></label>
+<label>Record<select name="id"><option value="alice-notes">alice-notes</option><option value="bob-notes">bob-notes</option><option value="garden-day">garden-day</option><option value="reader-notes">reader-notes</option></select></label>
+<label>Operation<select name="op"><option value="read">Read</option><option value="write">Update text</option><option value="whoami">Show verified ID for enrollment</option></select></label>
+<label>Replacement text<textarea name="text" maxlength="300">Synthetic note: evening shift requested.</textarea></label><label>Expected version<input name="version" type="number" min="1" value="1"></label><button id="prepare" type="submit">Prepare request</button></form><div id="google-button"></div><p id="status" role="status"></p></section>
+<footer>Public synthetic preview only. Private access awaits Google setup and deployment verification.</footer></main></body></html>
