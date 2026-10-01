@@ -1,40 +1,382 @@
 'use strict';
-const cfg=window.TRACKER_CONFIG,status=document.getElementById('status');let jsonpBusy=false;
-function jsonp(op){return new Promise((resolve,reject)=>{
- if(jsonpBusy)return reject(new Error('Request already in progress'));jsonpBusy=true;
- const tag=document.createElement('script'),timer=setTimeout(()=>finish(new Error('API timeout')),15000);
- function finish(error,data){clearTimeout(timer);tag.remove();delete window.trackerCallback;jsonpBusy=false;error?reject(error):resolve(data);}
- window.trackerCallback=data=>finish(null,data);const u=new URL(cfg.apiUrl,location.href);u.searchParams.set('op',op);u.searchParams.set('callback','trackerCallback');tag.src=u.href;tag.onerror=()=>finish(new Error('API failed'));document.head.appendChild(tag);
-});}
-async function submit(fields,credential,challenge){
- if(cfg.privateTransport==='fetch-experiment'){
-  try{
-   const response=await fetch(cfg.apiUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({...fields,credential,challenge}),redirect:'follow'});
-   const result=await response.json();status.textContent=JSON.stringify(result,null,2);
-   document.getElementById('google-button').replaceChildren();
-   for(const input of document.getElementById('request').elements)input.disabled=false;
-  }catch(e){status.textContent='Response unavailable. A write may have committed. Do not retry blindly; inspect version with a fresh read. Reload before another request.';}
-  return;
- }
- const form=document.createElement('form');form.method='POST';form.action=cfg.apiUrl;
- for(const [name,value]of Object.entries({...fields,credential,challenge})){const i=document.createElement('input');i.type='hidden';i.name=name;i.value=value;form.appendChild(i);}document.body.appendChild(form);form.submit();}
-function loadGIS(){return new Promise((resolve,reject)=>{const s=document.createElement('script');s.src='https://accounts.google.com/gsi/client';s.onload=resolve;s.onerror=reject;document.head.appendChild(s);});}
-if(cfg.mode==='google'){document.getElementById('mode').textContent='Google deployment experiment: synthetic data only; development-only tokeninfo verifier.';const identity=document.getElementById('identity');if(identity)identity.parentElement.remove();}
-if(cfg.mode==='offline'){
- document.getElementById('mode').textContent='Synthetic public preview. Google sign-in and the private backend are not connected yet.';
- const p=document.createElement('p');p.textContent='Community garden day - Saturday: bring spare gloves. (synthetic sample)';document.getElementById('public').appendChild(p);
- for(const control of document.getElementById('request').elements)control.disabled=true;
- status.textContent='Private requests are disabled until the approved Google setup is complete.';
-}else{
-jsonp('public').then(rows=>{for(const r of rows){const p=document.createElement('p');p.textContent=r.title+' - '+r.text+' (v'+r.version+')';document.getElementById('public').appendChild(p);}}).catch(e=>{status.textContent=e.message;});
+const cfg = window.TRACKER_CONFIG || {};
+const el = (id) => document.getElementById(id);
+const status = el('status');
+const allowedApiOrigins = new Set(['https://script.google.com']);
+let jsonpBusy = false;
+let session = null;
+let identityChallenge = null;
+let identityRequestId = null;
+let gisPromise = null;
+let busy = false;
+const pending = new Map();
+
+function say(message, tone) {
+  status.textContent = message;
+  status.dataset.tone = tone || 'neutral';
 }
-document.getElementById('request').addEventListener('submit',async event=>{
- event.preventDefault();document.getElementById('prepare').disabled=true;const fields=Object.fromEntries(new FormData(event.target));if(fields.op!=='write'){delete fields.text;delete fields.version;}
- try{const {challenge}=await jsonp('challenge');
-  if(cfg.mode==='mock'){const r=await fetch('/demo-token',{method:'POST',body:new URLSearchParams({sub:document.getElementById('identity').value,challenge})});const data=await r.json();submit(fields,data.credential,challenge);}
-  else{await loadGIS();const nonce=JSON.parse(atob(challenge.split('.')[0].replace(/-/g,'+').replace(/_/g,'/'))).nonce;
-   google.accounts.id.initialize({client_id:cfg.clientId,nonce,auto_select:false,callback:r=>submit(fields,r.credential,challenge)});
-   document.getElementById('google-button').replaceChildren();google.accounts.id.renderButton(document.getElementById('google-button'),{theme:'outline',size:'large'});
-   status.textContent='Sign in to submit within five minutes. Reload to change the request or after expiry.';for(const input of event.target.elements)input.disabled=true;}
- }catch(e){status.textContent=e.message;document.getElementById('prepare').disabled=false;}
+
+function validateConfig() {
+  try {
+    const url = new URL(cfg.apiUrl);
+    return url.protocol === 'https:' && allowedApiOrigins.has(url.origin) &&
+      /^\/macros\/s\/[^/]+\/exec$/.test(url.pathname) && !url.search && !url.hash &&
+      typeof cfg.clientId === 'string' && /^[0-9]+-[a-z0-9-]+\.apps\.googleusercontent\.com$/.test(cfg.clientId);
+  } catch (_) {
+    return false;
+  }
+}
+
+function randomRequestId() {
+  if (!window.crypto || typeof window.crypto.getRandomValues !== 'function') throw new Error('Secure sign-in needs a modern browser on HTTPS.');
+  const bytes = new Uint8Array(24);
+  window.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function jsonp(params) {
+  return new Promise((resolve, reject) => {
+    if (jsonpBusy) return reject(new Error('A request is already in progress.'));
+    jsonpBusy = true;
+    const script = document.createElement('script');
+    const url = new URL(cfg.apiUrl);
+    for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+    url.searchParams.set('callback', 'trackerCallback');
+    const timer = window.setTimeout(() => finish(new Error('The community service did not respond.')), 15000);
+    function finish(error, result) {
+      window.clearTimeout(timer);
+      script.remove();
+      delete window.trackerCallback;
+      jsonpBusy = false;
+      if (error) reject(error); else resolve(result);
+    }
+    window.trackerCallback = (result) => finish(null, result);
+    script.src = url.href;
+    script.onerror = () => finish(new Error('The community service is unavailable.'));
+    document.head.appendChild(script);
+  });
+}
+
+async function getChallenge(gameOp, requestId) {
+  const response = await jsonp({ op: 'app.challenge', gameOp, requestId });
+  if (!response || typeof response.challenge !== 'string') throw new Error('A secure request could not be prepared. Please try again.');
+  return response.challenge;
+}
+
+function acceptedOrigin(event) {
+  return window.TrackerBridge && window.TrackerBridge.accepts(event, pending.get(event.data && event.data.requestId));
+}
+
+function clearPending(requestId, entry) {
+  if (entry.timer) window.clearTimeout(entry.timer);
+  pending.delete(requestId);
+  if (entry.form) entry.form.remove();
+  if (entry.frame) entry.frame.remove();
+}
+
+function postBridge(gameOp, requestId, challenge, values) {
+  return new Promise((resolve, reject) => {
+    const frame = document.createElement('iframe');
+    frame.name = `tracker-response-${requestId}`;
+    frame.title = 'Secure community response';
+    frame.hidden = true;
+    frame.setAttribute('aria-hidden', 'true');
+    frame.tabIndex = -1;
+    const form = document.createElement('form');
+    form.method = 'POST';
+    form.action = cfg.apiUrl;
+    form.target = frame.name;
+    form.hidden = true;
+    const fields = { app: 'game', gameOp, requestId, challenge, ...values };
+    for (const [name, value] of Object.entries(fields)) {
+      if (typeof value !== 'string') return reject(new Error('The secure request contains invalid data.'));
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = name;
+      input.value = value;
+      form.appendChild(input);
+    }
+    const entry = { requestId, frame, form, resolve, reject, timer: null };
+    entry.timer = window.setTimeout(() => {
+      clearPending(requestId, entry);
+      reject(new Error('The response timed out. Check your connection and try again.'));
+    }, 25000);
+    pending.set(requestId, entry);
+    document.body.append(frame, form);
+    try {
+      form.submit();
+      for (const input of Array.from(form.elements)) {
+        input.value = '';
+        input.remove();
+      }
+    } catch (_) {
+      clearPending(requestId, entry);
+      reject(new Error('The secure request could not be sent.'));
+    }
+  });
+}
+
+window.addEventListener('message', (event) => {
+  if (!acceptedOrigin(event)) return;
+  const message = event.data;
+  const entry = pending.get(message.requestId);
+  if (!entry) return;
+  clearPending(message.requestId, entry);
+  if (message.ok) entry.resolve(message.data);
+  else entry.reject(Object.assign(new Error(friendlyError(message.error)), { code: message.error }));
 });
+
+async function sendGame(gameOp, values, fixedChallenge, fixedRequestId) {
+  const requestId = fixedRequestId || randomRequestId();
+  const challenge = fixedChallenge || await getChallenge(gameOp, requestId);
+  return postBridge(gameOp, requestId, challenge, values);
+}
+
+function friendlyError(code) {
+  const messages = {
+    DENIED: 'This Google account does not have access to that player space.',
+    INVALID_IDENTITY: 'Google sign-in could not be verified. Please sign in again.',
+    INVALID_CHALLENGE: 'The secure request expired. Please start again.',
+    INVALID_SESSION: 'Your sign-in has expired. Please sign in again.',
+    SESSION_REVOKED: 'You have signed out. Sign in again to continue.',
+    DEMO_DISABLED: 'The community app is temporarily unavailable.',
+    STORAGE_UNAVAILABLE: 'The community app is temporarily unavailable.',
+    BUSY: 'The community service is busy. Please try again shortly.'
+  };
+  return messages[code] || 'Something went wrong. Please try again.';
+}
+
+function decodeChallengeNonce(challenge) {
+  const body = challenge.split('.')[0].replace(/-/g, '+').replace(/_/g, '/');
+  const decoded = window.atob(body + '='.repeat((4 - body.length % 4) % 4));
+  const payload = JSON.parse(decoded);
+  if (typeof payload.nonce !== 'string' || !payload.nonce) throw new Error('The sign-in request could not be prepared.');
+  return payload.nonce;
+}
+
+function loadGIS() {
+  if (window.google && window.google.accounts) return Promise.resolve();
+  if (gisPromise) return gisPromise;
+  gisPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.async = true;
+    script.defer = true;
+    script.onload = resolve;
+    script.onerror = () => reject(new Error('Google sign-in could not be loaded. Check your connection and try again.'));
+    document.head.appendChild(script);
+  });
+  return gisPromise;
+}
+
+function setBusy(value) {
+  busy = value;
+  el('sign-in').disabled = value;
+  el('sign-out').disabled = value;
+  el('refresh-profile').disabled = value;
+  el('sign-in').setAttribute('aria-busy', String(value));
+}
+
+async function beginSignIn() {
+  if (busy) return;
+  setBusy(true);
+  el('google-button').replaceChildren();
+  try {
+    identityRequestId = randomRequestId();
+    identityChallenge = await getChallenge('exchange', identityRequestId);
+    await loadGIS();
+    const nonce = decodeChallengeNonce(identityChallenge);
+    window.google.accounts.id.initialize({
+      client_id: cfg.clientId,
+      nonce,
+      auto_select: false,
+      callback: async (response) => {
+        if (busy) return;
+        setBusy(true);
+        el('google-button').replaceChildren();
+        try {
+          if (!response || typeof response.credential !== 'string') throw new Error('Google sign-in did not return an identity token.');
+          const data = await sendGame('exchange', { credential: response.credential }, identityChallenge, identityRequestId);
+          if (data.enrollmentNeeded === true) {
+            const verifiedSub = document.createElement('code');
+            verifiedSub.textContent = data.sub;
+            el('account-name').textContent = 'Your Google account is verified';
+            el('account-detail').replaceChildren(document.createTextNode('Ask the community owner to add this account: '), verifiedSub);
+            el('account-badge').textContent = 'Access requested';
+            say('Your account is verified. The owner can add it to the player group before your profile becomes available.', 'notice');
+            return;
+          }
+          if (typeof data.session !== 'string') throw new Error('Your player session could not be started.');
+          session = data.session;
+          el('account-badge').textContent = 'Loading profile';
+          say('Opening your player space…', 'neutral');
+          await loadProfile();
+        } catch (error) {
+          clearProfile(error.message || 'Sign-in failed. Please try again.');
+          status.dataset.tone = 'error';
+        } finally {
+          if (response && typeof response.credential === 'string') response.credential = '';
+          identityChallenge = null;
+          identityRequestId = null;
+          el('google-button').replaceChildren();
+          el('sign-in').hidden = Boolean(session);
+          setBusy(false);
+        }
+      }
+    });
+    el('sign-in').hidden = true;
+    window.google.accounts.id.renderButton(el('google-button'), { theme: 'outline', size: 'large', shape: 'pill', text: 'signin_with', width: 220 });
+    say('Choose your Google account to continue.', 'neutral');
+    setBusy(false);
+  } catch (error) {
+    identityChallenge = null;
+    identityRequestId = null;
+    el('google-button').replaceChildren();
+    say(error.message || 'Sign-in could not be started.', 'error');
+    setBusy(false);
+  }
+}
+
+function clearProfile(message) {
+  session = null;
+  el('account-badge').textContent = 'Signed out';
+  el('account-name').textContent = 'Your profile is waiting';
+  el('account-detail').textContent = 'Sign in with Google to open your player profile and the pages shared with your role.';
+  el('role-chip').hidden = true;
+  el('page-list').replaceChildren(Object.assign(document.createElement('p'), { className: 'empty-state', textContent: 'Your available pages will appear here after you sign in.' }));
+  el('page-preview').hidden = true;
+  el('page-preview').replaceChildren();
+  el('sign-out').hidden = true;
+  el('refresh-profile').hidden = true;
+  el('sign-in').hidden = false;
+  if (message) say(message, 'neutral');
+}
+
+async function loadProfile() {
+  if (!session) return;
+  const data = await sendGame('profile', { session });
+  if (!data.profile || typeof data.profile.displayName !== 'string' || !Array.isArray(data.pages)) throw new Error('Your profile response was incomplete.');
+  const { profile, pages } = data;
+  el('account-name').textContent = profile.displayName;
+  el('account-detail').textContent = 'Your community profile and currently available pages.';
+  el('account-badge').textContent = 'Signed in';
+  el('role-chip').textContent = profile.role;
+  el('role-chip').hidden = false;
+  el('sign-out').hidden = false;
+  el('refresh-profile').hidden = false;
+  el('sign-in').hidden = true;
+  el('page-list').replaceChildren();
+  if (!pages.length) {
+    const empty = document.createElement('p');
+    empty.className = 'empty-state';
+    empty.textContent = 'There are no shared pages for your role yet.';
+    el('page-list').append(empty);
+  }
+  for (const page of pages) {
+    if (!page || typeof page.id !== 'string' || typeof page.title !== 'string') continue;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'page-card';
+    const title = document.createElement('span');
+    title.className = 'page-card-title';
+    title.textContent = page.title;
+    const action = document.createElement('span');
+    action.className = 'page-card-action';
+    action.textContent = 'View page';
+    button.append(title, action);
+    button.addEventListener('click', () => showPage(page));
+    el('page-list').append(button);
+  }
+  say('Your profile is up to date.', 'success');
+}
+
+function showPage(page) {
+  const preview = el('page-preview');
+  const heading = document.createElement('h3');
+  heading.textContent = page.title;
+  const message = document.createElement('p');
+  message.textContent = 'This page is ready for your player space. Its shared content will be available soon.';
+  preview.replaceChildren(heading, message);
+  preview.hidden = false;
+  preview.focus({ preventScroll: true });
+  preview.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'nearest' });
+}
+
+async function refreshProfile() {
+  if (busy || !session) return;
+  setBusy(true);
+  try {
+    await loadProfile();
+  } catch (error) {
+    if (error.code === 'INVALID_SESSION' || error.code === 'SESSION_REVOKED' || error.code === 'DENIED') {
+      clearProfile('Your player session has ended. Sign in again to continue.');
+    } else {
+      say(error.message || 'Your profile could not be refreshed. Please try again.', 'error');
+    }
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function signOut() {
+  if (busy || !session) return;
+  setBusy(true);
+  const currentSession = session;
+  try {
+    await sendGame('logout', { session: currentSession });
+    clearProfile('You have signed out.');
+  } catch (error) {
+    clearProfile('Your local sign-in has been cleared. Sign in again to continue.');
+    if (window.google && window.google.accounts) window.google.accounts.id.disableAutoSelect();
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function loadPublicBoard() {
+  try {
+    const items = await jsonp({ op: 'public' });
+    if (!Array.isArray(items)) throw new Error('The community board is unavailable.');
+    const board = el('public-board');
+    board.replaceChildren();
+    if (!items.length) {
+      const empty = document.createElement('p');
+      empty.className = 'empty-state';
+      empty.textContent = 'There are no new community notes right now.';
+      board.append(empty);
+      return;
+    }
+    for (const item of items) {
+      const card = document.createElement('article');
+      card.className = 'event-card';
+      const label = document.createElement('p');
+      label.className = 'event-label';
+      label.textContent = 'COMMUNITY NOTE';
+      const title = document.createElement('h3');
+      title.textContent = String(item.title || 'Community note');
+      const copy = document.createElement('p');
+      copy.textContent = String(item.text || '');
+      card.append(label, title, copy);
+      board.append(card);
+    }
+  } catch (error) {
+    const board = el('public-board');
+    const unavailable = document.createElement('p');
+    unavailable.className = 'empty-state';
+    unavailable.textContent = 'The community board is taking a short break. Please check again soon.';
+    board.replaceChildren(unavailable);
+  }
+}
+
+el('sign-in').addEventListener('click', beginSignIn);
+el('sign-out').addEventListener('click', signOut);
+el('refresh-profile').addEventListener('click', refreshProfile);
+
+if (!validateConfig()) {
+  el('sign-in').disabled = true;
+  el('sign-in').title = 'Google sign-in has not been configured for this site.';
+  say('This community space is being prepared. Please check back soon.', 'notice');
+} else {
+  say('Sign in to open your player profile and shared pages.', 'neutral');
+}
+loadPublicBoard();
