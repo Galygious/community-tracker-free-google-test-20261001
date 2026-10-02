@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Reader access verification</title>
+  <style>
+    :root { font: 16px/1.5 system-ui, sans-serif; color: #25352e; background: #f4f5ed; }
+    body { max-width: 48rem; margin: 0 auto; padding: 2rem 1rem; }
+    main { padding: clamp(1.2rem, 4vw, 2.3rem); border: 1px solid #d9ded4; border-radius: 1rem; background: white; }
+    h1 { margin-top: 0; line-height: 1.2; }
+    p { max-width: 68ch; }
+    .note { padding: .8rem 1rem; border-left: .25rem solid #53745e; background: #eef3eb; }
+    .sign-in-slot { width: 220px; min-height: 44px; margin: 1.25rem 0; }
+    button, input { font: inherit; }
+    button { min-height: 44px; padding: .55rem .85rem; border: 1px solid #315c45; border-radius: .55rem; color: white; background: #315c45; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: wait; }
+    button:focus-visible, input:focus-visible { outline: 3px solid #c07828; outline-offset: 2px; }
+    #retry { width: 220px; }
+    label { display: block; margin: .9rem 0; font-weight: 600; }
+    input { display: block; width: min(100%, 25rem); box-sizing: border-box; margin-top: .25rem; padding: .5rem; border: 1px solid #aab9aa; border-radius: .4rem; }
+    ol { padding-left: 1.5rem; }
+    li { margin: .4rem 0; }
+    [hidden] { display: none !important; }
+  </style>
+  <script src="config.js"></script>
+  <script src="bridge.js?v=observed-origin-1"></script>
+</head>
+<body>
+  <main>
+    <h1>Reader access verification</h1>
+    <p class="note">This unlinked check uses your real Google sign-in and the current community service. It makes at most 12 private form requests on this page. It shows only pass/fail and error codes; it does not show account identifiers, credentials, sessions, challenges, page content, or private data.</p>
+    <p id="state" role="status" aria-live="polite">Preparing Google sign-in…</p>
+    <div id="sign-in-slot" class="sign-in-slot">
+      <button id="retry" type="button" disabled>Preparing Google sign-in…</button>
+      <div id="google-button" hidden></div>
+    </div>
+    <section id="checks" hidden aria-label="Reader verification inputs">
+      <p>Enter the verified reader subject, a different enrolled player's subject, and the seeded moderation item ID. These values stay in this page's memory for one run and are cleared from the fields before requests begin.</p>
+      <label>Expected reader subject<input id="expected-sub" type="password" autocomplete="off" spellcheck="false" inputmode="numeric"></label>
+      <label>Other player's subject<input id="other-sub" type="password" autocomplete="off" spellcheck="false" inputmode="numeric"></label>
+      <label>Moderation item ID<input id="queue-id" type="password" autocomplete="off" spellcheck="false"></label>
+      <button id="run" type="button">Run reader checks</button>
+    </section>
+    <ol id="results" aria-label="Verification results"></ol>
+  </main>
+  <script>
+    (() => {
+      'use strict';
+      const maxPosts = 12;
+      const fixedOrigins = new Set(['https://script.google.com', 'https://script.googleusercontent.com']);
+      const state = document.getElementById('state');
+      const retry = document.getElementById('retry');
+      const googleButton = document.getElementById('google-button');
+      const signInSlot = document.getElementById('sign-in-slot');
+      const checks = document.getElementById('checks');
+      const runButton = document.getElementById('run');
+      const results = document.getElementById('results');
+      const apiUrl = canonicalApiUrl();
+      let posts = 0;
+      let session = null;
+      let pending = null;
+      let gisPromise = null;
+      let gisInitialized = false;
+      let signInGeneration = 0;
+      let signInDeadline = 0;
+      let signInTimer = null;
+      let signing = false;
+      let runStarted = false;
+
+      function say(value) { state.textContent = value; }
+      function canonicalApiUrl() {
+        try {
+          const raw = window.TRACKER_CONFIG && window.TRACKER_CONFIG.apiUrl;
+          const url = new URL(raw);
+          const clientId = window.TRACKER_CONFIG && window.TRACKER_CONFIG.clientId;
+          if (typeof raw !== 'string' || raw.length > 512 || url.href !== raw || url.origin !== 'https://script.google.com' ||
+              url.username || url.password || url.search || url.hash || !/^\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(url.pathname) ||
+              typeof clientId !== 'string' || !/^[0-9]+-[a-z0-9-]+\.apps\.googleusercontent\.com$/.test(clientId)) return null;
+          return url;
+        } catch (_) { return null; }
+      }
+      function requestId() {
+        const bytes = new Uint8Array(24);
+        window.crypto.getRandomValues(bytes);
+        return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+      }
+      function challengePayload(challenge) {
+        const body = challenge.split('.')[0].replace(/-/g, '+').replace(/_/g, '/');
+        const value = JSON.parse(window.atob(body + '='.repeat((4 - body.length % 4) % 4)));
+        if (!value || typeof value.nonce !== 'string' || !value.nonce || !Number.isInteger(value.exp)) throw new Error('PREPARE');
+        return value;
+      }
+      async function challengeFor(op, id) {
+        if (!apiUrl || !['exchange', 'profile', 'page.get', 'data.get', 'data.write'].includes(op)) throw new Error('PREPARE');
+        const url = new URL(apiUrl.href);
+        url.searchParams.set('op', 'app.challenge');
+        url.searchParams.set('gameOp', op);
+        url.searchParams.set('requestId', id);
+        url.searchParams.set('callback', 'trackerCallback');
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 15000);
+        try {
+          const response = await fetch(url.href, { method: 'GET', credentials: 'omit', mode: 'cors', redirect: 'follow',
+            cache: 'no-store', referrerPolicy: 'no-referrer', signal: controller.signal });
+          if (!response.ok || !fixedOrigins.has(new URL(response.url).origin) ||
+              (response.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase() !== 'text/javascript') throw new Error('PREPARE');
+          const length = response.headers.get('content-length');
+          if (length !== null && (!/^\d+$/.test(length.trim()) || Number(length) > 65536)) throw new Error('PREPARE');
+          const text = await response.text();
+          if (new TextEncoder().encode(text).byteLength > 65536) throw new Error('PREPARE');
+          const match = /^\s*trackerCallback\((\{[\s\S]*\})\);\s*$/.exec(text);
+          if (!match) throw new Error('PREPARE');
+          const value = JSON.parse(match[1]);
+          if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 1 ||
+              typeof value.challenge !== 'string' || value.challenge.length < 20 || value.challenge.length > 1600) throw new Error('PREPARE');
+          return value.challenge;
+        } catch (_) { throw new Error('PREPARE'); }
+        finally { window.clearTimeout(timer); }
+      }
+      function closePending(entry) {
+        if (entry.timer !== null) window.clearTimeout(entry.timer);
+        entry.form.remove();
+        entry.frame.remove();
+        if (pending === entry) pending = null;
+      }
+      window.addEventListener('message', (event) => {
+        const entry = pending;
+        if (!entry || !window.TrackerBridge || !window.TrackerBridge.accepts(event, entry)) return;
+        const answer = event.data;
+        closePending(entry);
+        entry.resolve(answer.ok ? { ok: true, data: answer.data } : { ok: false, error: answer.error });
+      });
+      function bridgePost(op, values, prepared) {
+        if (!apiUrl || pending || posts >= maxPosts) return Promise.reject(new Error('LIMIT'));
+        return (async () => {
+          const id = prepared ? prepared.id : requestId();
+          const challenge = prepared ? prepared.challenge : await challengeFor(op, id);
+          if (posts >= maxPosts) throw new Error('LIMIT');
+          return new Promise((resolve, reject) => {
+            const frame = document.createElement('iframe');
+            frame.name = `reader-verify-${id}`;
+            frame.title = 'Hidden reader verification response';
+            frame.hidden = true;
+            frame.setAttribute('aria-hidden', 'true');
+            frame.tabIndex = -1;
+            const form = document.createElement('form');
+            form.method = 'POST';
+            form.enctype = 'application/x-www-form-urlencoded';
+            form.action = apiUrl.href;
+            form.target = frame.name;
+            form.hidden = true;
+            const fields = { app: 'game', gameOp: op, requestId: id, challenge, ...values };
+            const inputs = [];
+            for (const [name, value] of Object.entries(fields)) {
+              if (typeof value !== 'string') { reject(new Error('PREPARE')); return; }
+              const input = document.createElement('input');
+              input.type = 'hidden'; input.name = name; input.value = value;
+              form.appendChild(input); inputs.push(input);
+            }
+            const entry = { requestId: id, frame, form, resolve, timer: null };
+            entry.timer = window.setTimeout(() => { closePending(entry); reject(new Error('TIMEOUT')); }, 25000);
+            pending = entry;
+            document.body.append(frame, form);
+            try {
+              posts += 1;
+              form.submit();
+            } catch (_) {
+              closePending(entry);
+              reject(new Error('TRANSPORT'));
+            } finally {
+              for (const input of inputs) { input.value = ''; input.remove(); }
+              for (const key of Object.keys(fields)) fields[key] = '';
+            }
+          });
+        })();
+      }
+      function loadGIS() {
+        if (window.google && window.google.accounts && window.google.accounts.id) return Promise.resolve();
+        if (gisPromise) return gisPromise;
+        gisPromise = new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = 'https://accounts.google.com/gsi/client';
+          script.async = true; script.defer = true;
+          script.onload = resolve;
+          script.onerror = () => { gisPromise = null; script.remove(); reject(new Error('GIS')); };
+          document.head.appendChild(script);
+        });
+        return gisPromise;
+      }
+      function retireSignIn(message) {
+        signInGeneration += 1;
+        signInDeadline = 0;
+        if (signInTimer !== null) window.clearTimeout(signInTimer);
+        signInTimer = null;
+        googleButton.replaceChildren();
+        googleButton.hidden = true;
+        retry.hidden = Boolean(session);
+        retry.disabled = false;
+        retry.textContent = gisInitialized ? 'Refresh sign-in' : 'Try Google sign-in again';
+        if (message) say(message);
+      }
+      async function prepareSignIn() {
+        if (signing || session) return;
+        if (gisInitialized) { window.location.reload(); return; }
+        signing = true;
+        const generation = ++signInGeneration;
+        retry.disabled = true;
+        retry.textContent = 'Preparing Google sign-in…';
+        retry.hidden = false;
+        googleButton.hidden = true;
+        try {
+          const id = requestId();
+          const challenge = await challengeFor('exchange', id);
+          await loadGIS();
+          if (generation !== signInGeneration || session) return;
+          const payload = challengePayload(challenge);
+          const freshForMs = Math.min(240000, payload.exp * 1000 - Date.now() - 45000);
+          if (freshForMs <= 0) throw new Error('PREPARE');
+          signInDeadline = Date.now() + freshForMs;
+          gisInitialized = true;
+          window.google.accounts.id.initialize({ client_id: window.TRACKER_CONFIG.clientId, nonce: payload.nonce,
+            auto_select: false, callback: async (response) => {
+              if (generation !== signInGeneration || session || signing || Date.now() >= signInDeadline) {
+                if (response && typeof response.credential === 'string') response.credential = '';
+                if (generation === signInGeneration && !session && !signing) retireSignIn('Sign-in preparation expired. Refresh sign-in.');
+                return;
+              }
+              if (signInTimer !== null) window.clearTimeout(signInTimer);
+              signInTimer = null;
+              signing = true;
+              googleButton.replaceChildren(); googleButton.hidden = true;
+              let credential = response && typeof response.credential === 'string' ? response.credential : '';
+              if (response && typeof response.credential === 'string') response.credential = '';
+              try {
+                if (!credential) throw new Error('IDENTITY');
+                const answer = await bridgePost('exchange', { credential }, { id, challenge });
+                credential = '';
+                if (!answer.ok || !answer.data || typeof answer.data.session !== 'string') throw new Error('IDENTITY');
+                session = answer.data.session;
+                signInSlot.hidden = true;
+                checks.hidden = false;
+                say('Google identity verified. Enter the three verification values, then run the bounded checks.');
+              } catch (_) {
+                session = null;
+                say('Identity exchange did not produce an enrolled session. Refresh sign-in to retry.');
+              } finally {
+                credential = '';
+                retireSignIn();
+                signing = false;
+              }
+            } });
+          window.google.accounts.id.renderButton(googleButton, { theme: 'outline', size: 'large', shape: 'pill', text: 'signin_with', width: 220 });
+          retry.hidden = true;
+          googleButton.hidden = false;
+          signInTimer = window.setTimeout(() => {
+            if (generation === signInGeneration && !session && !signing) retireSignIn('Sign-in preparation expired. Refresh sign-in.');
+          }, freshForMs);
+          say('Choose your Google account to prepare the reader checks.');
+        } catch (_) { retireSignIn('Google sign-in could not be prepared. Try again.'); }
+        finally { signing = false; }
+      }
+      function retireExpiredSignIn() {
+        if (signInDeadline && Date.now() >= signInDeadline && !session && !signing) retireSignIn('Sign-in preparation expired. Refresh sign-in.');
+      }
+      function validSubject(value) { return /^[A-Za-z0-9_-]{1,128}$/.test(value); }
+      function result(name, passed, observed) {
+        const item = document.createElement('li');
+        item.textContent = `${name}: ${passed ? 'PASS' : 'STOP'} (${observed})`;
+        results.appendChild(item);
+      }
+      function safeCode(answer) {
+        if (answer.ok) return 'OK';
+        return typeof answer.error === 'string' && /^[A-Z_]{1,40}$/.test(answer.error) ? answer.error : 'UNEXPECTED';
+      }
+      async function expect(name, op, values, expectedCode) {
+        const answer = await bridgePost(op, { session, ...values });
+        const observed = safeCode(answer);
+        const pass = observed === expectedCode;
+        result(name, pass, observed);
+        if (!pass) throw new Error('STOP');
+        return answer;
+      }
+      async function runChecks() {
+        if (runStarted || !session) return;
+        const expected = document.getElementById('expected-sub').value.trim();
+        const other = document.getElementById('other-sub').value.trim();
+        const queueId = document.getElementById('queue-id').value.trim();
+        document.getElementById('expected-sub').value = '';
+        document.getElementById('other-sub').value = '';
+        document.getElementById('queue-id').value = '';
+        if (!validSubject(expected) || !validSubject(other) || expected === other || !/^[A-Za-z0-9_-]{1,40}$/.test(queueId)) {
+          say('Verification values were invalid. Re-enter them to run the checks.');
+          return;
+        }
+        runStarted = true;
+        runButton.disabled = true;
+        checks.hidden = true;
+        say('Running bounded reader checks…');
+        try {
+          const id = requestId();
+          const challenge = await challengeFor('profile', id);
+          const profile = await bridgePost('profile', { session }, { id, challenge });
+          const own = profile.ok && profile.data && profile.data.profile;
+          const identityMatches = own && own.sub === expected && own.role === 'reader';
+          result('Verified reader profile', Boolean(identityMatches), identityMatches ? 'OK' : (profile.ok ? 'ACCOUNT_MISMATCH' : safeCode(profile)));
+          if (!identityMatches) throw new Error('STOP');
+          const replay = await bridgePost('profile', { session }, { id, challenge });
+          const replayCode = safeCode(replay);
+          result('Used challenge replay', replayCode === 'REPLAY', replayCode);
+          if (replayCode !== 'REPLAY') throw new Error('STOP');
+          const ownData = await bridgePost('data.get', { session, pageId: 'profile' });
+          const ownProfile = ownData.ok && ownData.data && ownData.data.profile;
+          const ownValid = ownProfile && ownProfile.sub === expected && ownProfile.version === 1;
+          result('Own profile data and fixture version', Boolean(ownValid), ownValid ? 'OK' : (ownData.ok ? 'FIXTURE_MISMATCH' : safeCode(ownData)));
+          if (!ownValid) throw new Error('STOP');
+          await expect('Member guides page denied', 'page.get', { pageId: 'guides' }, 'DENIED');
+          await expect('Moderation page denied', 'page.get', { pageId: 'moderation' }, 'DENIED');
+          await expect('Unknown page denied', 'page.get', { pageId: 'not-a-real-page' }, 'DENIED');
+          await expect('Other player data denied', 'data.get', { pageId: 'profile', objectId: other }, 'DENIED');
+          await expect('Reader goal write denied', 'data.write',
+            { pageId: 'profile', currentGoal: 'Reader verification probe.', expectedVersion: '1' }, 'DENIED');
+          await expect('Moderation status write denied', 'data.write',
+            { pageId: 'moderation', objectId: queueId, status: 'resolved', expectedVersion: '1' }, 'DENIED');
+          const parts = session.split('.');
+          if (parts.length !== 2 || !parts[1]) throw new Error('STOP');
+          const badSession = `${parts[0]}.${parts[1][0] === 'A' ? 'B' : 'A'}${parts[1].slice(1)}`;
+          const tampered = await bridgePost('profile', { session: badSession });
+          const tamperedCode = safeCode(tampered);
+          result('Tampered session denied', tamperedCode === 'INVALID_SESSION', tamperedCode);
+          if (tamperedCode !== 'INVALID_SESSION') throw new Error('STOP');
+          say('Reader checks completed. Only status codes were displayed.');
+        } catch (_) {
+          say('Checks stopped at the first unexpected result or transport error. No further requests were sent.');
+        } finally { session = null; }
+      }
+      retry.addEventListener('click', prepareSignIn);
+      runButton.addEventListener('click', () => { void runChecks(); });
+      window.addEventListener('focus', retireExpiredSignIn);
+      window.addEventListener('pageshow', retireExpiredSignIn);
+      document.addEventListener('visibilitychange', retireExpiredSignIn);
+      if (!apiUrl || !window.TrackerBridge || !window.crypto || !window.crypto.getRandomValues) {
+        retry.disabled = true;
+        say('This verification page is not configured for the community service.');
+      } else { void prepareSignIn(); }
+    })();
+  </script>
+</body>
+</html>
