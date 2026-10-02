@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="referrer" content="no-referrer">
-  <title>Reader access verification</title>
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>Member access verification</title>
   <style>
     :root { font: 16px/1.5 system-ui, sans-serif; color: #25352e; background: #f4f5ed; }
     body { max-width: 48rem; margin: 0 auto; padding: 2rem 1rem; }
@@ -29,19 +29,19 @@
 </head>
 <body>
   <main>
-    <h1>Reader access verification</h1>
+    <h1>Member access verification</h1>
     <p class="note">This unlinked check uses your real Google sign-in and the current community service. It makes at most 12 private form requests on this page. It shows only pass/fail and error codes; it does not show account identifiers, credentials, sessions, challenges, page content, or private data.</p>
     <p id="state" role="status" aria-live="polite">Preparing Google sign-in…</p>
     <div id="sign-in-slot" class="sign-in-slot">
       <button id="retry" type="button" disabled>Preparing Google sign-in…</button>
       <div id="google-button" hidden></div>
     </div>
-    <section id="checks" hidden aria-label="Reader verification inputs">
-      <p>Enter the verified reader subject, a different enrolled player's subject, and the seeded moderation item ID. These values stay in this page's memory for one run and are cleared from the fields before requests begin.</p>
-      <label>Expected reader subject<input id="expected-sub" type="password" autocomplete="off" spellcheck="false" inputmode="numeric"></label>
+    <section id="checks" hidden aria-label="Member verification inputs">
+      <p>Enter the verified member subject, a different enrolled player's subject, and the seeded moderation item ID. These values stay in this page's memory for one run and are cleared from the fields before requests begin.</p>
+      <label>Expected member subject<input id="expected-sub" type="password" autocomplete="off" spellcheck="false" inputmode="numeric"></label>
       <label>Other player's subject<input id="other-sub" type="password" autocomplete="off" spellcheck="false" inputmode="numeric"></label>
       <label>Moderation item ID<input id="queue-id" type="password" autocomplete="off" spellcheck="false"></label>
-      <button id="run" type="button">Run reader checks</button>
+      <button id="run" type="button">Run member checks</button>
     </section>
     <ol id="results" aria-label="Verification results"></ol>
   </main>
@@ -140,8 +140,8 @@
           if (posts >= maxPosts) throw new Error('LIMIT');
           return new Promise((resolve, reject) => {
             const frame = document.createElement('iframe');
-            frame.name = `reader-verify-${id}`;
-            frame.title = 'Hidden reader verification response';
+            frame.name = `member-verify-${id}`;
+            frame.title = 'Hidden member verification response';
             frame.hidden = true;
             frame.setAttribute('aria-hidden', 'true');
             frame.tabIndex = -1;
@@ -257,7 +257,7 @@
           signInTimer = window.setTimeout(() => {
             if (generation === signInGeneration && !session && !signing) retireSignIn('Sign-in preparation expired. Refresh sign-in.');
           }, freshForMs);
-          say('Choose your Google account to prepare the reader checks.');
+          say('Choose your Google account to prepare the member checks.');
         } catch (_) { retireSignIn('Google sign-in could not be prepared. Try again.'); }
         finally { signing = false; }
       }
@@ -297,14 +297,14 @@
         runStarted = true;
         runButton.disabled = true;
         checks.hidden = true;
-        say('Running bounded reader checks…');
+        say('Running bounded member checks…');
         try {
           const id = requestId();
           const challenge = await challengeFor('profile', id);
           const profile = await bridgePost('profile', { session }, { id, challenge });
           const own = profile.ok && profile.data && profile.data.profile;
-          const identityMatches = own && own.sub === expected && own.role === 'reader';
-          result('Verified reader profile', Boolean(identityMatches), identityMatches ? 'OK' : (profile.ok ? 'ACCOUNT_MISMATCH' : safeCode(profile)));
+          const identityMatches = own && own.sub === expected && own.role === 'member';
+          result('Verified member profile', Boolean(identityMatches), identityMatches ? 'OK' : (profile.ok ? 'ACCOUNT_MISMATCH' : safeCode(profile)));
           if (!identityMatches) throw new Error('STOP');
           const replay = await bridgePost('profile', { session }, { id, challenge });
           const replayCode = safeCode(replay);
@@ -312,17 +312,21 @@
           if (replayCode !== 'REPLAY') throw new Error('STOP');
           const ownData = await bridgePost('data.get', { session, pageId: 'profile' });
           const ownProfile = ownData.ok && ownData.data && ownData.data.profile;
-          const ownValid = ownProfile && ownProfile.sub === expected && ownProfile.version === 1;
-          result('Own profile data and fixture version', Boolean(ownValid), ownValid ? 'OK' : (ownData.ok ? 'FIXTURE_MISMATCH' : safeCode(ownData)));
+          const ownValid = ownProfile && ownProfile.sub === expected && Number.isInteger(ownProfile.version) &&
+            ownProfile.version >= 1 && ownProfile.version <= 999999999 && typeof ownProfile.currentGoal === 'string' && ownProfile.currentGoal.length <= 300;
+          result('Own profile data and version', Boolean(ownValid), ownValid ? 'OK' : (ownData.ok ? 'PROFILE_MISMATCH' : safeCode(ownData)));
           if (!ownValid) throw new Error('STOP');
-          await expect('Member guides page denied', 'page.get', { pageId: 'guides' }, 'DENIED');
           await expect('Moderation page denied', 'page.get', { pageId: 'moderation' }, 'DENIED');
-          await expect('Unknown page denied', 'page.get', { pageId: 'not-a-real-page' }, 'DENIED');
-          await expect('Other player data denied', 'data.get', { pageId: 'profile', objectId: other }, 'DENIED');
-          await expect('Reader goal write denied', 'data.write',
-            { pageId: 'profile', currentGoal: 'Reader verification probe.', expectedVersion: '1' }, 'DENIED');
+          await expect('Moderation data denied', 'data.get', { pageId: 'moderation' }, 'DENIED');
           await expect('Moderation status write denied', 'data.write',
             { pageId: 'moderation', objectId: queueId, status: 'resolved', expectedVersion: '1' }, 'DENIED');
+          await expect('Unknown page denied', 'page.get', { pageId: 'not-a-real-page' }, 'DENIED');
+          await expect('Other player data denied', 'data.get', { pageId: 'profile', objectId: other }, 'DENIED');
+          await expect('Other player goal write denied', 'data.write',
+            { pageId: 'profile', objectId: other, currentGoal: 'Access verification probe.', expectedVersion: '1' }, 'DENIED');
+          const staleVersion = ownProfile.version === 1 ? '999999999' : '1';
+          await expect('Stale own goal write rejected', 'data.write',
+            { pageId: 'profile', currentGoal: ownProfile.currentGoal, expectedVersion: staleVersion }, 'CONFLICT');
           const parts = session.split('.');
           if (parts.length !== 2 || !parts[1]) throw new Error('STOP');
           const badSession = `${parts[0]}.${parts[1][0] === 'A' ? 'B' : 'A'}${parts[1].slice(1)}`;
@@ -330,7 +334,7 @@
           const tamperedCode = safeCode(tampered);
           result('Tampered session denied', tamperedCode === 'INVALID_SESSION', tamperedCode);
           if (tamperedCode !== 'INVALID_SESSION') throw new Error('STOP');
-          say('Reader checks completed. Only status codes were displayed.');
+          say('Member checks completed. Only status codes were displayed.');
         } catch (_) {
           say('Checks stopped at the first unexpected result or transport error. No further requests were sent.');
         } finally { session = null; }
